@@ -1,7 +1,7 @@
 require("dotenv").config();
 import path from "path";
 import fs from "fs";
-import { Client, Collection, Events, GatewayIntentBits } from "discord.js";
+import { Client, Collection, Events, GatewayIntentBits, Partials } from "discord.js";
 import deployCommands from "./deploy/deployCommands";
 
 // Load environment variables
@@ -14,7 +14,11 @@ const client = new Client({
         GatewayIntentBits.GuildMessages,
         GatewayIntentBits.Guilds,
         GatewayIntentBits.MessageContent,
+		GatewayIntentBits.DirectMessages,
+		GatewayIntentBits.DirectMessageTyping
+
     ],
+	partials: [Partials.Channel],
 });
 
 client.commands = new Collection();
