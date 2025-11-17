@@ -3,9 +3,17 @@ import path from "path";
 import fs from "fs";
 import { Client, Collection, Events, GatewayIntentBits } from "discord.js";
 import deployCommands from "./deploy/deployCommands";
+import { MERLIN_SYSTEM_PROMPT } from "./system/system";
+import Groq from "groq-sdk";
+
 
 // Load environment variables
 const BOT_TOKEN = process.env.DISCORD_LLM_BOT_TOKEN; 
+const GROQ_MODEL = process.env.GROQ_MODEL || "llama-3.1-8b-instant";
+
+const groq = new Groq({
+  apiKey: process.env.GROQ_API_KEY!,
+});
 
 // Create an instance of Client and set the intents to listen for messages.
 const client = new Client({
@@ -67,6 +75,71 @@ client.on(Events.InteractionCreate, async interaction => {
 		}
 	}
 });
+
+
+
+	client.on(Events.MessageCreate, async (message) => {
+	// 1) Ignore bot messages (including Merlin herself)
+	if (message.author.bot) return;
+
+	const isDM = !message.guild;
+
+	// 2) Decide if Merlin should answer
+	const botUser = client.user;
+	if (!botUser) return;
+
+	let shouldAnswer = false;
+
+	if (isDM) {
+		// In DMs, answer everything
+		shouldAnswer = true;
+	} else {
+		// In servers, only answer if mentioned or her name is in the message
+		const mentionedMe = message.mentions.has(botUser);
+		const contentLower = message.content.toLowerCase();
+		const saidMyName = contentLower.includes("merlin");
+
+		if (mentionedMe || saidMyName) {
+		shouldAnswer = true;
+		}
+	}
+
+	if (!shouldAnswer) return;
+
+	// 3) Clean the user text (remove the mention tag if present)
+	const rawText = message.content.replace(/<@!?\d+>/g, "").trim();
+	if (!rawText) {
+		// If they just wrote "@Merlin" and nothing else
+		return message.reply("Yes, Faiber?");
+	}
+
+	try {
+		console.time("merlin-mention-groq");
+
+		const completion = await groq.chat.completions.create({
+		model: GROQ_MODEL, // same env-based model as /prompt
+		messages: [
+			{ role: "system", content: MERLIN_SYSTEM_PROMPT },
+			{ role: "user", content: rawText },
+		],
+		max_tokens: 256,
+		temperature: 0.7,
+		});
+
+		console.timeEnd("merlin-mention-groq");
+
+		const replyText =
+		completion.choices[0]?.message?.content?.trim() ??
+		"Merlin tried to answer but something went wrong.";
+
+		await message.reply(replyText);
+	} catch (err) {
+		console.error("Error in Merlin mention handler:", err);
+		await message.reply("My core glitched for a moment. Try again.");
+	}
+	});
+
+
 
 // Log in with the bot's token.
 client.login(BOT_TOKEN);

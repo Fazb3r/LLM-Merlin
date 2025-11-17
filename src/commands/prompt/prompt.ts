@@ -3,6 +3,9 @@ import Queue from "../../queue/queue";
 
 const queue = new Queue();
 
+
+
+
 module.exports = {
 	data: new SlashCommandBuilder()
 		.setName('prompt')

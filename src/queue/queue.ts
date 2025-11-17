@@ -1,64 +1,81 @@
-import { ChatInputCommandInteraction, DiscordAPIError, 
-    Message, TextChannel, ThreadAutoArchiveDuration, ThreadChannel } from "discord.js";
+    import {
+    ChatInputCommandInteraction,
+    TextChannel,
+    ThreadAutoArchiveDuration,
+    ThreadChannel,
+    } from "discord.js";
 
-const wait = require('node:timers/promises').setTimeout;
+    import Groq from "groq-sdk";
+    import { MERLIN_SYSTEM_PROMPT } from "../system/system";
+    import { setTimeout as wait } from "node:timers/promises";
 
-interface QueueObject {
-    //Interaction id are always in ascending order
+    const groq = new Groq({
+    apiKey: process.env.GROQ_API_KEY!,
+    });
+
+    interface QueueObject {
     [interactionId: string]: {
-        interaction: ChatInputCommandInteraction,
+        interaction: ChatInputCommandInteraction;
         status: {
-            position: number,
-            processing: boolean,
-            waiting: boolean
-        },
-        thread: ThreadChannel | undefined
+        position: number;
+        processing: boolean;
+        waiting: boolean;
+        };
+        thread: ThreadChannel | undefined;
+    };
     }
-}
 
-class Queue {
+    class Queue {
     queue: QueueObject;
     interval: NodeJS.Timeout | undefined;
-    //The amount of messages to process at the same time
+
+    // How many tasks to process at the same time
     private static readonly CONCURRENT_QUEUE_SIZE = 3;
-    private static readonly LLM_MODEL = "llama3.2:latest";
+
+    // Default model if GROQ_MODEL not set
+    private static readonly LLM_MODEL =
+        process.env.GROQ_MODEL || "llama3-8b-8192";
 
     constructor() {
         this.queue = {};
     }
 
     addItem(interaction: ChatInputCommandInteraction) {
-        //How many items are already in the queue?
         const queueLength = this.length();
+
         this.queue[interaction.id] = {
-            interaction: interaction,
-            status: {
-                position: queueLength,
-                processing: false,
-                waiting: false
-            },
-            thread: undefined
+        interaction,
+        status: {
+            position: queueLength, // 0-based index
+            processing: false,
+            waiting: false,
+        },
+        thread: undefined,
         };
 
-        //If queue is stopped
-        if (this.interval === undefined){
-            console.log("Starting the queue processor");
-            this.startQueue();
+        if (!this.interval) {
+        console.log("Starting the queue processor");
+        this.startQueue();
         }
     }
 
     removeItem(interactionId: string) {
         console.log(`Removed ${interactionId} from queue`);
-        delete this.queue[interactionId]
-        //Update the positions of the other queue items
-        const interactionIds = Object.keys(this.queue);
-        for (let i = 0; i < interactionIds.length; i++){
-            this.queue[interactionIds[i]].status.position--;
-        }
+        delete this.queue[interactionId];
+
+        // Re-normalize positions
+        const ids = Object.keys(this.queue).sort(
+        (a, b) =>
+            this.queue[a].status.position - this.queue[b].status.position,
+        );
+
+        ids.forEach((id, index) => {
+        this.queue[id].status.position = index;
+        });
     }
 
     getItem(interactionId: string) {
-        return this.queue[interactionId]
+        return this.queue[interactionId];
     }
 
     length() {
@@ -66,175 +83,170 @@ class Queue {
     }
 
     isEmpty() {
-        return Object.keys(this.queue).length === 0 && this.queue.constructor === Object;
+        return this.length() === 0;
     }
 
     startQueue() {
-        this.interval = setInterval(() => this.processQueue(), 3000)
+        if (this.interval) return;
+        // Check more often for lower latency
+        this.interval = setInterval(() => {
+        void this.processQueue();
+        }, 500);
     }
 
     stopQueue() {
-        console.log("Entire queue has been processed. Stopping the queue processor")
+        console.log(
+        "Entire queue has been processed. Stopping the queue processor",
+        );
+        if (this.interval) {
         clearInterval(this.interval);
         this.interval = undefined;
+        }
     }
 
     assignThread(interactionId: string, thread: ThreadChannel) {
+        if (!this.queue[interactionId]) return;
         this.queue[interactionId].thread = thread;
     }
 
-    processQueue = async () => {
-        //If the queue is empty, return and stop checking queue status
-        if (this.isEmpty()){
-            this.stopQueue();
-            return;
+    private async processQueue(): Promise<void> {
+        if (this.isEmpty()) {
+        this.stopQueue();
+        return;
         }
 
-        const interactionIds = Object.keys(this.queue);
-        let currentlyBeingProcessedCount = 0;
+        // Process items in queue order
+        const ids = Object.keys(this.queue).sort(
+        (a, b) =>
+            this.queue[a].status.position - this.queue[b].status.position,
+        );
 
-        for (let i = 0; i < interactionIds.length; i++){
-            const interactionId = interactionIds[i];
-            const positionInQueue = this.queue[interactionId].status.position;
-            const processing = this.queue[interactionId].status.processing;
-            const interaction = this.queue[interactionId].interaction; 
-            const channelId = this.queue[interactionId].interaction.channelId;      
-            const channel = await this.queue[interactionId].interaction.client.channels.fetch(channelId);
-            
-            //Check if it's unprocessed
-            if (!processing && currentlyBeingProcessedCount < Queue.CONCURRENT_QUEUE_SIZE){
-                console.log(`Processing task with interaction id ${interactionId}`)
-                //Change status to processing
-                this.queue[interactionId].status.processing = true;
-                //Process the interaction
-                this.processTask(interaction, <TextChannel>channel!);
-                currentlyBeingProcessedCount++;
+        // Count already processing
+        let currentlyBeingProcessedCount = ids.filter(
+        (id) => this.queue[id].status.processing,
+        ).length;
+
+        for (const interactionId of ids) {
+        const item = this.queue[interactionId];
+        const { position, processing, waiting } = item.status;
+        const interaction = item.interaction;
+        const channelId = interaction.channelId;
+        const channel = await interaction.client.channels.fetch(channelId);
+
+        if (!channel || !("isTextBased" in channel) || !channel.isTextBased()) {
+            continue;
+        }
+
+        // Not processing yet
+        if (!processing) {
+            if (
+            currentlyBeingProcessedCount <
+            Queue.CONCURRENT_QUEUE_SIZE
+            ) {
+            console.log(
+                `Processing task with interaction id ${interactionId}`,
+            );
+            item.status.processing = true;
+            item.status.waiting = false;
+
+            // Fire and forget; errors handled inside processTask
+            void this.processTask(
+                interaction,
+                channel as TextChannel,
+            );
+
+            currentlyBeingProcessedCount++;
+            } else {
+            // In queue: update message once, don't spam
+            if (!waiting) {
+                item.status.waiting = true;
+                const peopleAhead = Math.max(
+                0,
+                position - Queue.CONCURRENT_QUEUE_SIZE,
+                );
+
+                await wait(500);
+                await interaction.editReply(
+                peopleAhead > 0
+                    ? `There are ${peopleAhead} people ahead of you in the queue. Please wait your turn...`
+                    : `You are currently waiting in the queue. Please wait your turn...`,
+                );
             }
-            else if (!processing && currentlyBeingProcessedCount > Queue.CONCURRENT_QUEUE_SIZE){
-                //We want the message to reflect order in the queue
-                await wait(3000); //Wait to not hit the discord 5/second request limit
-                await interaction.editReply(`There are ${positionInQueue - Queue.CONCURRENT_QUEUE_SIZE}`
-                    + ` people ahead of you in the queue. Please wait your turn...`);
-                
             }
-            else{
-                currentlyBeingProcessedCount++;
-            }
+        }
         }
     }
 
-    processTask = async (interaction: ChatInputCommandInteraction, channel: TextChannel) => {
-        const prompt = interaction.options.getString("input");
+    private async processTask(
+        interaction: ChatInputCommandInteraction,
+        channel: TextChannel,
+    ): Promise<void> {
+        console.time("merlin-total");
+
+        const prompt = interaction.options.getString("input") ?? "hi";
         const userId = interaction.user.id;
         const userName = interaction.user.displayName;
 
-        //Log the channel ID and message content to the console
-        console.log(`User sent message ${userId} with prompt: ${prompt}`);
+        console.log(
+        `User sent message ${userId} with prompt: ${prompt}`,
+        );
 
         const newThread = await channel.threads.create({
-            name: `[${userName}] - Prompt: ${prompt ?? "Prompt"}`,
-            autoArchiveDuration: ThreadAutoArchiveDuration.OneHour,
-            reason: 'LLM Bot Auto Created Thread',
+        name: `[${userName}] - Prompt: ${prompt.slice(0, 40) || "Prompt"}`,
+        autoArchiveDuration: ThreadAutoArchiveDuration.OneHour,
+        reason: "LLM Bot Auto Created Thread",
         });
 
         this.assignThread(interaction.id, newThread);
 
-        const url = "http://localhost:11434/api/generate"
+        try {
+        console.time("groq-call");
 
-        const data = {
-            "prompt": interaction.options.getString("input"),
-            "model": Queue.LLM_MODEL,
-            "stream": true
-        }
-
-        const removeItem = (interactionId: string) => {
-            this.removeItem(interactionId);
-        }
-
-        fetch(url, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json'
-            }, 
-            body: JSON.stringify(data)
-        })
-        .then((response) => {
-            const reader = response.body?.getReader();
-            const decoder = new TextDecoder();
-            let result = "";
-            let responseChunks: Array<string> = [];
-            let messages: Array<Message> = [];
-
-            //We can't exceed Discord rate limits
-            const throttleResponse = async () => {
-                //Every second send the most updated data
-                //Bots are limited to 2000 characters
-                //TODO: split into multiple messages if > 2000 chars.
-
-                if (messages.length === 0 || messages.length !== responseChunks.length){
-                    const message = await newThread.send(responseChunks[responseChunks.length - 1]);
-                    messages.push(message);
-                }
-
-                for (let i = 0; i < messages.length; i++){
-                    if (messages[i].content !== responseChunks[i]){
-                        messages[i].edit(responseChunks[i]);
-                    }
-                }
-
-            }
-
-            const throttleResponseInterval = setInterval(() => throttleResponse(), 2000);
-
-            return new ReadableStream({
-                start(controller) {
-                    return pump();
-                    function pump(): any {
-                        return reader?.read().then(async function( { done, value }){
-                            // When no more data needs to be consumed, close the stream
-                            if (done) {
-                                console.log(`Task with interaction id ${interaction.id} complete.`);
-                                await wait(2000);
-                                messages[messages.length - 1].edit(responseChunks[responseChunks.length - 1]);
-                                clearInterval(throttleResponseInterval);
-                                await interaction.deleteReply();
-                                removeItem(interaction.id);
-                                controller.close();
-                                return;
-                            }
-                            
-                            const chunk = JSON.parse(decoder.decode(value)).response;
-
-                            if (responseChunks.length === 0){
-                                responseChunks.push(result);
-                            }
-
-                            if (result.length + chunk.length > 1800){
-                                responseChunks.push(chunk);
-                                result = "";
-                            }
-                            else{
-                                responseChunks[responseChunks.length - 1] = responseChunks[responseChunks.length - 1].concat(chunk);
-                                result += chunk;
-                            }    
-
-                            // Enqueue the next data chunk into our target stream
-                            controller.enqueue(value);
-                            return pump();
-                        });
-                    }
-                },
-            });
-        })
-        .catch(async (error) => {
-            console.error('Error:', error);
-            if (error instanceof DiscordAPIError && error.code === 10008){
-                //unknown message error - happens when you send a message in the same thread as bot while processing
-                await newThread.send("WARNING: Sending messages in the same thread as the bot while processing may break the response.");
-            }
-            await interaction.editReply("An error occured. Please try again later.");
+        const completion = await groq.chat.completions.create({
+            model: Queue.LLM_MODEL,
+            messages: [
+            {
+                role: "system",
+                content:
+                "You are Merlin. Reply in one short sentence.",
+            },
+            {
+                role: "user",
+                content: prompt,
+            },
+            ],
+            max_tokens: 32,
+            temperature: 0.5,
         });
-    }
-}
 
-export default Queue;
+        console.timeEnd("groq-call");
+
+        const fullResponse =
+            completion.choices[0]?.message?.content ??
+            "Merlin couldn’t think of anything to say 🧙‍♀️";
+
+        await newThread.send(fullResponse);
+
+        try {
+            await interaction.deleteReply();
+        } catch {
+            // ignore
+        }
+
+        this.removeItem(interaction.id);
+        } catch (error: unknown) {
+        console.error("Error while calling Groq:", error);
+        await newThread.send(
+            "Merlin ran into an error talking to the model. Try again in a bit 🧙‍♀️",
+        );
+        await interaction.editReply(
+            "An error occured. Please try again later.",
+        );
+        this.removeItem(interaction.id);
+        }
+
+        console.timeEnd("merlin-total");
+    }
+    }
+
+    export default Queue;
