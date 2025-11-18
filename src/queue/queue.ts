@@ -1,33 +1,32 @@
-    import {
+import {
     ChatInputCommandInteraction,
     TextChannel,
     ThreadAutoArchiveDuration,
     ThreadChannel,
-    } from "discord.js";
+} from "discord.js";
 
-    import Groq from "groq-sdk";
-    import { MERLIN_SYSTEM_PROMPT } from "../system/system";
-    import { setTimeout as wait } from "node:timers/promises";
-    import { looksLikeWebQuestion, searchWebWithTavily } from "../utils/webSearch";
+import Groq from "groq-sdk";
+import { MERLIN_SYSTEM_PROMPT } from "../system/system";
+import { setTimeout as wait } from "node:timers/promises";
+import { shouldSearchWeb, searchWebWithTavily } from "../utils/webSearch";
 
-
-    const groq = new Groq({
+const groq = new Groq({
     apiKey: process.env.GROQ_API_KEY!,
-    });
+});
 
-    interface QueueObject {
+interface QueueObject {
     [interactionId: string]: {
         interaction: ChatInputCommandInteraction;
         status: {
-        position: number;
-        processing: boolean;
-        waiting: boolean;
+            position: number;
+            processing: boolean;
+            waiting: boolean;
         };
         thread: ThreadChannel | undefined;
     };
-    }
+}
 
-    class Queue {
+class Queue {
     queue: QueueObject;
     interval: NodeJS.Timeout | undefined;
 
@@ -46,18 +45,18 @@
         const queueLength = this.length();
 
         this.queue[interaction.id] = {
-        interaction,
-        status: {
-            position: queueLength, // 0-based index
-            processing: false,
-            waiting: false,
-        },
-        thread: undefined,
+            interaction,
+            status: {
+                position: queueLength, // 0-based index
+                processing: false,
+                waiting: false,
+            },
+            thread: undefined,
         };
 
         if (!this.interval) {
-        console.log("Starting the queue processor");
-        this.startQueue();
+            console.log("Starting the queue processor");
+            this.startQueue();
         }
     }
 
@@ -67,12 +66,12 @@
 
         // Re-normalize positions
         const ids = Object.keys(this.queue).sort(
-        (a, b) =>
-            this.queue[a].status.position - this.queue[b].status.position,
+            (a, b) =>
+                this.queue[a].status.position - this.queue[b].status.position,
         );
 
         ids.forEach((id, index) => {
-        this.queue[id].status.position = index;
+            this.queue[id].status.position = index;
         });
     }
 
@@ -92,17 +91,17 @@
         if (this.interval) return;
         // Check more often for lower latency
         this.interval = setInterval(() => {
-        void this.processQueue();
+            void this.processQueue();
         }, 500);
     }
 
     stopQueue() {
         console.log(
-        "Entire queue has been processed. Stopping the queue processor",
+            "Entire queue has been processed. Stopping the queue processor",
         );
         if (this.interval) {
-        clearInterval(this.interval);
-        this.interval = undefined;
+            clearInterval(this.interval);
+            this.interval = undefined;
         }
     }
 
@@ -113,69 +112,69 @@
 
     private async processQueue(): Promise<void> {
         if (this.isEmpty()) {
-        this.stopQueue();
-        return;
+            this.stopQueue();
+            return;
         }
 
         // Process items in queue order
         const ids = Object.keys(this.queue).sort(
-        (a, b) =>
-            this.queue[a].status.position - this.queue[b].status.position,
+            (a, b) =>
+                this.queue[a].status.position - this.queue[b].status.position,
         );
 
         // Count already processing
         let currentlyBeingProcessedCount = ids.filter(
-        (id) => this.queue[id].status.processing,
+            (id) => this.queue[id].status.processing,
         ).length;
 
         for (const interactionId of ids) {
-        const item = this.queue[interactionId];
-        const { position, processing, waiting } = item.status;
-        const interaction = item.interaction;
-        const channelId = interaction.channelId;
-        const channel = await interaction.client.channels.fetch(channelId);
+            const item = this.queue[interactionId];
+            const { position, processing, waiting } = item.status;
+            const interaction = item.interaction;
+            const channelId = interaction.channelId;
+            const channel = await interaction.client.channels.fetch(channelId);
 
-        if (!channel || !("isTextBased" in channel) || !channel.isTextBased()) {
-            continue;
-        }
-
-        // Not processing yet
-        if (!processing) {
-            if (
-            currentlyBeingProcessedCount <
-            Queue.CONCURRENT_QUEUE_SIZE
-            ) {
-            console.log(
-                `Processing task with interaction id ${interactionId}`,
-            );
-            item.status.processing = true;
-            item.status.waiting = false;
-
-            // Fire and forget; errors handled inside processTask
-            void this.processTask(
-                interaction,
-                channel as TextChannel,
-            );
-
-            currentlyBeingProcessedCount++;
-            } else {
-            // In queue: update message once, don't spam
-            if (!waiting) {
-                item.status.waiting = true;
-                const peopleAhead = Math.max(
-                0,
-                position - Queue.CONCURRENT_QUEUE_SIZE,
-                );
-
-                await wait(500);
-                await interaction.editReply(
-                peopleAhead > 0
-                    ? `There are ${peopleAhead} people ahead of you in the queue. Please wait your turn...`
-                    : `You are currently waiting in the queue. Please wait your turn...`,
-                );
+            if (!channel || !("isTextBased" in channel) || !channel.isTextBased()) {
+                continue;
             }
+
+            // Not processing yet
+            if (!processing) {
+                if (
+                    currentlyBeingProcessedCount <
+                    Queue.CONCURRENT_QUEUE_SIZE
+                ) {
+                    console.log(
+                        `Processing task with interaction id ${interactionId}`,
+                    );
+                    item.status.processing = true;
+                    item.status.waiting = false;
+
+                    // Fire and forget; errors handled inside processTask
+                    void this.processTask(
+                        interaction,
+                        channel as TextChannel,
+                    );
+
+                    currentlyBeingProcessedCount++;
+                } else {
+                    // In queue: update message once, don't spam
+                    if (!waiting) {
+                        item.status.waiting = true;
+                        const peopleAhead = Math.max(
+                            0,
+                            position - Queue.CONCURRENT_QUEUE_SIZE,
+                        );
+
+                        await wait(500);
+                        await interaction.editReply(
+                            peopleAhead > 0
+                                ? `There are ${peopleAhead} people ahead of you in the queue. Please wait your turn...`
+                                : `You are currently waiting in the queue. Please wait your turn...`,
+                        );
+                    }
+                }
             }
-        }
         }
     }
 
@@ -185,92 +184,91 @@
     ): Promise<void> {
         console.time("merlin-total");
 
-    const prompt = interaction.options.getString("input") ?? "hi";
-    const userId = interaction.user.id;
-    const userName = interaction.user.displayName;
+        const prompt = interaction.options.getString("input") ?? "hi";
+        const userId = interaction.user.id;
+        const userName = interaction.user.displayName;
 
-    console.log(
-        `User sent message ${userId} with prompt: ${prompt}`,
-    );
+        console.log(
+            `User sent message ${userId} with prompt: ${prompt}`,
+        );
 
-    const newThread = await channel.threads.create({
-        name: `[${userName}] - Prompt: ${prompt.slice(0, 40) || "Prompt"}`,
-        autoArchiveDuration: ThreadAutoArchiveDuration.OneHour,
-        reason: "LLM Bot Auto Created Thread",
-    });
-
-    this.assignThread(interaction.id, newThread);
-
-    try {
-        console.time("groq-call");
-
-        // 1) Decide if this looks like a web question
-        let webContext = "";
-        if (prompt && looksLikeWebQuestion(prompt)) {
-            console.log("Looks like a web question, calling Tavily...");
-        const web = await searchWebWithTavily(prompt, "news");
-        if (web) {
-            webContext = web;
-        }
-        }
-
-        // 2) Build messages for Groq (Merlin + optional web info)
-        const messages: { role: "system" | "user"; content: string }[] = [
-        { role: "system", content: MERLIN_SYSTEM_PROMPT },
-        ];
-
-        if (webContext) {
-        messages.push({
-            role: "system",
-            content:
-            "Información reciente obtenida de la web. Úsala para responder con precisión, " +
-            "pero mantén tu tono y personalidad de Merlin. Si algo no está claro, dilo honestamente:\n\n" +
-            webContext,
-        });
-        }
-
-        messages.push({
-            role: "user",
-            content: prompt,
+        const newThread = await channel.threads.create({
+            name: `[${userName}] - Prompt: ${prompt.slice(0, 40) || "Prompt"}`,
+            autoArchiveDuration: ThreadAutoArchiveDuration.OneHour,
+            reason: "LLM Bot Auto Created Thread",
         });
 
-        // 3) Call Groq with Merlin + (maybe) web context
-        const completion = await groq.chat.completions.create({
-            model: Queue.LLM_MODEL,
-            messages,
-            max_tokens: 256,
-            temperature: 0.7,
-        });
-
-        console.timeEnd("groq-call");
-
-        const fullResponse =
-        completion.choices[0]?.message?.content ??
-        "Merlin couldn’t think of anything to say 🧙‍♀️";
-
-        await newThread.send(fullResponse);
+        this.assignThread(interaction.id, newThread);
 
         try {
-        await interaction.deleteReply();
-        } catch {
-        // ignore
+            console.time("groq-call");
+
+            // 1) Solo buscar si hay comando explícito de búsqueda
+            let webContext = "";
+            if (prompt && shouldSearchWeb(prompt)) {
+                console.log("Explicit search command detected, calling Tavily...");
+                const web = await searchWebWithTavily(prompt, "general");
+                if (web) {
+                    webContext = web;
+                }
+            }
+
+            // 2) Build messages for Groq (Merlin + optional web info)
+            const messages: { role: "system" | "user"; content: string }[] = [
+                { role: "system", content: MERLIN_SYSTEM_PROMPT },
+            ];
+
+            if (webContext) {
+                messages.push({
+                    role: "system",
+                    content:
+                        "Información reciente obtenida de la web. Úsala para responder con precisión, " +
+                        "pero mantén tu tono y personalidad de Merlin. Si algo no está claro, dilo honestamente:\n\n" +
+                        webContext,
+                });
+            }
+
+            messages.push({
+                role: "user",
+                content: prompt,
+            });
+
+            // 3) Call Groq with Merlin + (maybe) web context
+            const completion = await groq.chat.completions.create({
+                model: Queue.LLM_MODEL,
+                messages,
+                max_tokens: 256,
+                temperature: 0.7,
+            });
+
+            console.timeEnd("groq-call");
+
+            const fullResponse =
+                completion.choices[0]?.message?.content ??
+                "Merlin couldn't think of anything to say 🧙‍♀️";
+
+            await newThread.send(fullResponse);
+
+            try {
+                await interaction.deleteReply();
+            } catch {
+                // ignore
+            }
+
+            this.removeItem(interaction.id);
+        } catch (error: unknown) {
+            console.error("Error while calling Groq:", error);
+            await newThread.send(
+                "Merlin ran into an error talking to the model. Try again in a bit 🧙‍♀️",
+            );
+            await interaction.editReply(
+                "An error occured. Please try again later.",
+            );
+            this.removeItem(interaction.id);
         }
 
-        this.removeItem(interaction.id);
-    } catch (error: unknown) {
-        console.error("Error while calling Groq:", error);
-        await newThread.send(
-        "Merlin ran into an error talking to the model. Try again in a bit 🧙‍♀️",
-        );
-        await interaction.editReply(
-        "An error occured. Please try again later.",
-        );
-        this.removeItem(interaction.id);
+        console.timeEnd("merlin-total");
     }
+}
 
-    console.timeEnd("merlin-total");
-    }
-
-    }
-
-    export default Queue;
+export default Queue;

@@ -1,85 +1,76 @@
-export function looksLikeWebQuestion(prompt: string): boolean {
+// src/utils/webSearch.ts
+
+/**
+ * Detecta si el usuario está explícitamente pidiendo una búsqueda web.
+ * Solo activa la búsqueda cuando hay comandos claros de búsqueda.
+ */
+export function shouldSearchWeb(prompt: string): boolean {
     const q = prompt.toLowerCase().trim();
 
-    // Very short or clearly casual → no web
-    if (q.length < 8) return false;
-
-    // Time-based triggers
-    const timeKeywords = [
-        // Spanish
-        "hoy", "ayer", "mañana",
-        "esta semana", "este mes", "este año",
-        "últimas noticias", "último", "reciente",
-        "actualmente", "ahora mismo",
-        "2023", "2024", "2025", "2026",
-        "anoche", "últimamente",
-
-        // English
-        "today", "yesterday", "tomorrow",
-        "this week", "this month", "this year",
-        "latest", "recent", "recently",
-        "currently", "right now",
-        "news", "breaking",
+    // Comandos explícitos de búsqueda en español
+    const spanishSearchCommands = [
+        "busca",
+        "búscame",
+        "buscame",
+        "investiga",
+        "investigame",
+        "investígame",
+        "averigua",
+        "averiguame",
+        "averíguame",
+        "consulta",
+        "consultame",
+        "consúltame",
     ];
 
-    // Fact-based triggers (info that usually changes over time)
-    const factKeywords = [
-        // Spanish
-        "precio", "precios", "cotización", "valor",
-        "acciones", "dólar", "euro", "inflación",
-        "clima", "tiempo", "temperatura", "pronóstico",
-        "ganador", "ganadores", "perdedor",
-        "resultado", "resultados", "marcador", "score",
-        "nominado", "nominados", "nominadas",
-        "ranking", "top", "tendencias", "tendencia",
-        "estreno", "lanzamiento",
-        "review", "reseñas", "opiniones",
-        "worlds", "mundial", "torneo", "liga",
-        "lol", "league of legends", "valorant", "csgo", "dota",
-        "fútbol", "nba", "mlb",
-
-        // English
-        "price", "prices", "stock", "stocks", "rate",
-        "weather", "forecast", "temperature",
-        "winner", "winners", "loser",
-        "result", "results", "scoreboard",
-        "nominated", "nominees", "nomination",
-        "launch", "release", "released",
-        "review", "reviews", "opinions",
-        "trending", "trend",
-        "ranking", "standings",
-        "championship", "tournament", "league", "cup",
-        "goty", "game of the year",
-        "esports", "matches", "fixtures",
+    // Comandos explícitos de búsqueda en inglés
+    const englishSearchCommands = [
+        "search",
+        "search for",
+        "look up",
+        "lookup",
+        "look this up",
+        "find out",
+        "check",
+        "investigate",
     ];
 
-    // Verbs meaning "go search / investigate"
-    const intentKeywords = [
-        // Spanish
-        "investiga", "investigar", "investigame",
-        "averigua", "averiguar",
-        "busca", "búscame", "buscame",
-        "consulta", "confirma", "verifica",
-        
-        // English
-        "search", "lookup", "look up", "check", "find",
-        "investigate", "investigate for me",
-        "look for", "look this up", "research",
-    ];
+    // Verificar si el mensaje EMPIEZA con alguno de estos comandos
+    // o si contiene el comando seguido de espacio/puntuación
+    for (const cmd of [...spanishSearchCommands, ...englishSearchCommands]) {
+        if (q.startsWith(cmd + " ") || 
+            q.startsWith(cmd + ",") || 
+            q === cmd ||
+            q.includes(" " + cmd + " ") ||
+            q.includes(" " + cmd + ",")) {
+            return true;
+        }
+    }
 
-    const hasTime = timeKeywords.some((k) => q.includes(k));
-    const hasFact = factKeywords.some((k) => q.includes(k));
-    const hasIntent = intentKeywords.some((k) => q.includes(k));
-
-    // Any of these three is enough
-    return hasTime || hasFact || hasIntent;
+    return false;
 }
 
-    // Uses global fetch (Node 18+). Make sure TAVILY_API_KEY is set in env.
-    export async function searchWebWithTavily(
+/**
+ * Función legacy - ahora simplemente llama a shouldSearchWeb
+ * @deprecated Use shouldSearchWeb instead
+ */
+export function looksLikeWebQuestion(prompt: string): boolean {
+    return shouldSearchWeb(prompt);
+}
+
+/**
+ * Función legacy - removida la complejidad de keywords
+ * @deprecated No longer needed with simplified approach
+ */
+export function hasExplicitSearchKeyword(prompt: string): boolean {
+    return shouldSearchWeb(prompt);
+}
+
+// Uses global fetch (Node 18+). Make sure TAVILY_API_KEY is set in env.
+export async function searchWebWithTavily(
     query: string,
     topic: "news" | "general" = "general"
-    ): Promise<string | null> {
+): Promise<string | null> {
     const apiKey = process.env.TAVILY_API_KEY;
     if (!apiKey) {
         console.warn("TAVILY_API_KEY is not set, skipping web search.");
@@ -89,15 +80,15 @@ export function looksLikeWebQuestion(prompt: string): boolean {
     const res = await fetch("https://api.tavily.com/search", {
         method: "POST",
         headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${apiKey}`,
         },
         body: JSON.stringify({
-        query,
-        topic,
-        search_depth: "advanced",
-        include_answer: true,
-        max_results: 5,
+            query,
+            topic,
+            search_depth: "advanced",
+            include_answer: true,
+            max_results: 5,
         }),
     });
 
@@ -118,15 +109,15 @@ export function looksLikeWebQuestion(prompt: string): boolean {
     if (Array.isArray(data.results)) {
         const top = data.results.slice(0, 3);
         parts.push(
-        "Fuentes consultadas:\n" +
-            top
-            .map(
-                (r: any, i: number) =>
-                `${i + 1}. ${r.title} — ${r.url}\n${r.content}`
-            )
-            .join("\n\n")
+            "Fuentes consultadas:\n" +
+                top
+                    .map(
+                        (r: any, i: number) =>
+                            `${i + 1}. ${r.title} — ${r.url}\n${r.content}`
+                    )
+                    .join("\n\n")
         );
     }
 
     return parts.join("\n\n");
-    }
+}
