@@ -5,7 +5,8 @@
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "build": "tsc",
-    "start": "node dist/bot.js"
+    "start": "node dist/bot.js",
+    "deploy:commands": "node dist/deploy/deployCommands.js"
   },
   "keywords": [],
   "author": "",

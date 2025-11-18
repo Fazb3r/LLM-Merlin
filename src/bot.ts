@@ -5,6 +5,9 @@ import { Client, Collection, Events, GatewayIntentBits } from "discord.js";
 import deployCommands from "./deploy/deployCommands";
 import { MERLIN_SYSTEM_PROMPT } from "./system/system";
 import Groq from "groq-sdk";
+import { looksLikeWebQuestion, searchWebWithTavily } from "./utils/webSearch";
+
+
 
 
 // Load environment variables
@@ -48,7 +51,7 @@ for (const folder of commandFolders) {
 }
 
 //Register our commands
-deployCommands();
+//deployCommands();
 
 // Once the WebSocket is connected, log a message to the console.
 client.once(Events.ClientReady, () => {
@@ -78,66 +81,102 @@ client.on(Events.InteractionCreate, async interaction => {
 
 
 
-	client.on(Events.MessageCreate, async (message) => {
-	// 1) Ignore bot messages (including Merlin herself)
-	if (message.author.bot) return;
+client.on(Events.MessageCreate, async (message) => {
+  // 1) Ignore bot messages (including Merlin herself)
+  if (message.author.bot) return;
 
-	const isDM = !message.guild;
+  const isDM = !message.guild;
+  const botUser = client.user;
+  if (!botUser) return;
 
-	// 2) Decide if Merlin should answer
-	const botUser = client.user;
-	if (!botUser) return;
+  const contentLower = message.content.toLowerCase();
 
-	let shouldAnswer = false;
+  // 2) Decide if Merlin should answer
+  let shouldAnswer = false;
 
-	if (isDM) {
-		// In DMs, answer everything
-		shouldAnswer = true;
-	} else {
-		// In servers, only answer if mentioned or her name is in the message
-		const mentionedMe = message.mentions.has(botUser);
-		const contentLower = message.content.toLowerCase();
-		const saidMyName = contentLower.includes("merlin");
+  if (isDM) {
+    // In DMs, answer everything
+    shouldAnswer = true;
+  } else {
+    // In servers, answer if:
+    // - user @mentions the bot
+    // - or message calls her by name / alias
+    const mentionedMe = message.mentions.has(botUser);
 
-		if (mentionedMe || saidMyName) {
-		shouldAnswer = true;
-		}
-	}
+    const saidMerlin = contentLower.includes("merlin");
+    const saidMer =
+    	contentLower.startsWith("mer ") ||
+    	contentLower.startsWith("mer,") ||
+    	contentLower.startsWith("mer:") ||
+    	contentLower === "mer";
+    const saidMerlina =
+    	contentLower.includes("merlina") ||
+    	contentLower.startsWith("merlina");
 
-	if (!shouldAnswer) return;
+    if (mentionedMe || saidMerlin || saidMer || saidMerlina) {
+    	shouldAnswer = true;
+    }
+}
 
-	// 3) Clean the user text (remove the mention tag if present)
+if (!shouldAnswer) return;
+
+  // 3) Clean the user text (remove the mention tag if present)
 	const rawText = message.content.replace(/<@!?\d+>/g, "").trim();
 	if (!rawText) {
-		// If they just wrote "@Merlin" and nothing else
-		return message.reply("Yes, Faiber?");
+    // If they just wrote "@Merlin" or "Mer" and nothing else
+    return message.reply("¿Sí, Faiber? 🧙‍♀️");
 	}
 
 	try {
-		console.time("merlin-mention-groq");
+    console.time("merlin-mention-groq");
 
-		const completion = await groq.chat.completions.create({
-		model: GROQ_MODEL, // same env-based model as /prompt
-		messages: [
-			{ role: "system", content: MERLIN_SYSTEM_PROMPT },
-			{ role: "user", content: rawText },
-		],
-		max_tokens: 256,
-		temperature: 0.7,
-		});
+    // 4) Decide if this looks like a web question
+    let webContext = "";
+    if (looksLikeWebQuestion(rawText)) {
+    	console.log("Mention looks like web question, calling Tavily...");
+    	const web = await searchWebWithTavily(rawText, "news");
+    	if (web) {
+        webContext = web;
+    	}
+    }
 
-		console.timeEnd("merlin-mention-groq");
+    // 5) Build messages for Groq (Merlin + optional web info)
+    const messages: { role: "system" | "user"; content: string }[] = [
+    	{ role: "system", content: MERLIN_SYSTEM_PROMPT },
+    ];
 
-		const replyText =
-		completion.choices[0]?.message?.content?.trim() ??
-		"Merlin tried to answer but something went wrong.";
+    if (webContext) {
+    	messages.push({
+        role: "system",
+        content:
+        	"Información reciente obtenida de la web. Úsala para responder con precisión, " +
+        	"pero mantén tu estilo y personalidad de Merlin. Si algo no está claro o falta info, dilo honestamente:\n\n" +
+        	webContext,
+      });
+    }
 
-		await message.reply(replyText);
+    messages.push({ role: "user", content: rawText });
+
+    // 6) Call Groq
+    const completion = await groq.chat.completions.create({
+    	model: GROQ_MODEL,
+    	messages,
+    	max_tokens: 256,
+    	temperature: 0.7,
+    });
+
+    console.timeEnd("merlin-mention-groq");
+
+    const replyText =
+    	completion.choices[0]?.message?.content?.trim() ??
+    	"Merlin tried to answer but something went wrong.";
+
+    await message.reply(replyText);
 	} catch (err) {
-		console.error("Error in Merlin mention handler:", err);
-		await message.reply("My core glitched for a moment. Try again.");
+    console.error("Error in Merlin mention handler:", err);
+    await message.reply("Mi núcleo se bugueó un segundo. Intenta otra vez 🧙‍♀️");
 	}
-	});
+});
 
 
 
