@@ -1,30 +1,79 @@
-    // src/utils/webSearch.ts
-    export function looksLikeWebQuestion(prompt: string): boolean {
+export function looksLikeWebQuestion(prompt: string): boolean {
     const q = prompt.toLowerCase().trim();
 
-    // Very short or clearly casual -> no web
-    if (q.length < 20) return false;
+    // Very short or clearly casual → no web
+    if (q.length < 8) return false;
 
-    // Time-related words: usually imply "current info"
+    // Time-based triggers
     const timeKeywords = [
-        "hoy", "ayer", "mañana", "esta semana", "este mes", "este año",
-        "últimas noticias", "último", "reciente", "actualmente", "ahora mismo",
-        "2023", "2024", "2025"
+        // Spanish
+        "hoy", "ayer", "mañana",
+        "esta semana", "este mes", "este año",
+        "últimas noticias", "último", "reciente",
+        "actualmente", "ahora mismo",
+        "2023", "2024", "2025", "2026",
+        "anoche", "últimamente",
+
+        // English
+        "today", "yesterday", "tomorrow",
+        "this week", "this month", "this year",
+        "latest", "recent", "recently",
+        "currently", "right now",
+        "news", "breaking",
     ];
 
-    // Fact / real-world info
+    // Fact-based triggers (info that usually changes over time)
     const factKeywords = [
-        "precio", "cotización", "acciones", "dólar", "euro", "clima", "tiempo",
-        "temperatura", "pronóstico", "ganador", "nominados", "resultados",
-        "marcador", "noticias", "tendencias", "estreno", "lanzamiento",
-        "ranking", "top", "mejores juegos", "review", "reseñas"
+        // Spanish
+        "precio", "precios", "cotización", "valor",
+        "acciones", "dólar", "euro", "inflación",
+        "clima", "tiempo", "temperatura", "pronóstico",
+        "ganador", "ganadores", "perdedor",
+        "resultado", "resultados", "marcador", "score",
+        "nominado", "nominados", "nominadas",
+        "ranking", "top", "tendencias", "tendencia",
+        "estreno", "lanzamiento",
+        "review", "reseñas", "opiniones",
+        "worlds", "mundial", "torneo", "liga",
+        "lol", "league of legends", "valorant", "csgo", "dota",
+        "fútbol", "nba", "mlb",
+
+        // English
+        "price", "prices", "stock", "stocks", "rate",
+        "weather", "forecast", "temperature",
+        "winner", "winners", "loser",
+        "result", "results", "scoreboard",
+        "nominated", "nominees", "nomination",
+        "launch", "release", "released",
+        "review", "reviews", "opinions",
+        "trending", "trend",
+        "ranking", "standings",
+        "championship", "tournament", "league", "cup",
+        "goty", "game of the year",
+        "esports", "matches", "fixtures",
     ];
 
-    const anyTime = timeKeywords.some(k => q.includes(k));
-    const anyFact = factKeywords.some(k => q.includes(k));
+    // Verbs meaning "go search / investigate"
+    const intentKeywords = [
+        // Spanish
+        "investiga", "investigar", "investigame",
+        "averigua", "averiguar",
+        "busca", "búscame", "buscame",
+        "consulta", "confirma", "verifica",
+        
+        // English
+        "search", "lookup", "look up", "check", "find",
+        "investigate", "investigate for me",
+        "look for", "look this up", "research",
+    ];
 
-    return anyTime || anyFact;
-    }
+    const hasTime = timeKeywords.some((k) => q.includes(k));
+    const hasFact = factKeywords.some((k) => q.includes(k));
+    const hasIntent = intentKeywords.some((k) => q.includes(k));
+
+    // Any of these three is enough
+    return hasTime || hasFact || hasIntent;
+}
 
     // Uses global fetch (Node 18+). Make sure TAVILY_API_KEY is set in env.
     export async function searchWebWithTavily(
