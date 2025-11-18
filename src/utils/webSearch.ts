@@ -2,7 +2,6 @@
 
 /**
  * Detecta si el usuario está explícitamente pidiendo una búsqueda web.
- * Solo activa la búsqueda cuando hay comandos claros de búsqueda.
  */
 export function shouldSearchWeb(prompt: string): boolean {
     const q = prompt.toLowerCase().trim();
@@ -35,8 +34,6 @@ export function shouldSearchWeb(prompt: string): boolean {
         "investigate",
     ];
 
-    // Verificar si el mensaje EMPIEZA con alguno de estos comandos
-    // o si contiene el comando seguido de espacio/puntuación
     for (const cmd of [...spanishSearchCommands, ...englishSearchCommands]) {
         if (q.startsWith(cmd + " ") || 
             q.startsWith(cmd + ",") || 
@@ -51,19 +48,91 @@ export function shouldSearchWeb(prompt: string): boolean {
 }
 
 /**
- * Función legacy - ahora simplemente llama a shouldSearchWeb
- * @deprecated Use shouldSearchWeb instead
+ * Detecta si la pregunta parece ser sobre eventos actuales o información reciente
+ * que está más allá del conocimiento de Merlin (después de diciembre 2023)
  */
-export function looksLikeWebQuestion(prompt: string): boolean {
-    return shouldSearchWeb(prompt);
+export function looksLikeCurrentEventQuestion(prompt: string): boolean {
+    const q = prompt.toLowerCase();
+    
+    // Indicadores temporales que sugieren información reciente
+    const temporalIndicators = [
+        // Años recientes
+        "2024", "2025", "2026",
+        
+        // Indicadores de tiempo presente/reciente - Español
+        "hoy", "ahora", "actual", "actualmente", "este año", "este mes",
+        "últimamente", "recientemente", "reciente", "último", "última",
+        "esta semana", "este fin de semana", "últimos días",
+        
+        // Indicadores de tiempo presente/reciente - Inglés
+        "today", "now", "current", "currently", "this year", "this month",
+        "lately", "recently", "recent", "latest", "last week", "this week",
+        
+        // Eventos que típicamente son actuales
+        "precio", "cotización", "vale", "cuesta", "cuánto cuesta",
+        "price", "cost", "worth", "how much",
+        
+        // Noticias y eventos
+        "noticia", "noticias", "pasó", "ocurrió", "sucedió",
+        "news", "happened", "occurred",
+        
+        // Premios y eventos anuales
+        "grammy", "grammys", "oscar", "oscars", "mundial", "world cup",
+        "elecciones", "election", "olimpiadas", "olympics",
+    ];
+    
+    // Frases que casi siempre indican búsqueda de info actual
+    const currentEventPhrases = [
+        "qué pasó",
+        "que paso",
+        "what happened",
+        "ganó los",
+        "ganaron los",
+        "won the",
+        "quién ganó",
+        "quien gano",
+        "who won",
+        "cuánto vale",
+        "cuanto vale",
+        "how much is",
+    ];
+    
+    // Verificar frases específicas primero (más específicas)
+    for (const phrase of currentEventPhrases) {
+        if (q.includes(phrase)) {
+            return true;
+        }
+    }
+    
+    // Verificar indicadores temporales
+    for (const indicator of temporalIndicators) {
+        if (q.includes(indicator)) {
+            return true;
+        }
+    }
+    
+    return false;
 }
 
 /**
- * Función legacy - removida la complejidad de keywords
- * @deprecated No longer needed with simplified approach
+ * Genera un mensaje de sugerencia cuando se detecta una pregunta sobre eventos actuales
  */
-export function hasExplicitSearchKeyword(prompt: string): boolean {
-    return shouldSearchWeb(prompt);
+export function getSuggestedSearchMessage(prompt: string): string {
+    const q = prompt.toLowerCase();
+    
+    // Detectar el idioma predominante
+    const spanishWords = ["qué", "que", "cómo", "como", "cuánto", "cuando", "dónde", "donde"];
+    const isSpanish = spanishWords.some(word => q.includes(word));
+    
+    if (isSpanish) {
+        return "Mi conocimiento llega hasta diciembre de 2023. Para obtener información actualizada, " +
+               "usa comandos como: 'busca...', 'consultame...', 'investiga...', o 'averigua...' " +
+               "seguido de tu pregunta.";
+    } else {
+        return "My knowledge ends in December 2023. For current information, " +
+               "use commands like: 'search...', 'look up...', or 'find out...' " +
+               "followed by your question.";
+    }
 }
 
 // Uses global fetch (Node 18+). Make sure TAVILY_API_KEY is set in env.

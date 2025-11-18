@@ -10,6 +10,8 @@ import Groq from "groq-sdk";
 import {
     shouldSearchWeb,
     searchWebWithTavily,
+    looksLikeCurrentEventQuestion,
+    getSuggestedSearchMessage,
 } from "./utils/webSearch";
 
 // Utilidad para eliminar emojis de cualquier respuesta
@@ -280,7 +282,7 @@ process.on('SIGINT', () => {
     console.log('Shutting down gracefully...');
     client.destroy();
     process.exit(0);
-})
+});
 
 process.on('SIGTERM', () => {
     console.log('Shutting down gracefully...');
