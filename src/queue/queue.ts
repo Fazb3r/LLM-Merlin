@@ -8,6 +8,8 @@
     import Groq from "groq-sdk";
     import { MERLIN_SYSTEM_PROMPT } from "../system/system";
     import { setTimeout as wait } from "node:timers/promises";
+    import { looksLikeWebQuestion, searchWebWithTavily } from "../utils/webSearch";
+
 
     const groq = new Groq({
     apiKey: process.env.GROQ_API_KEY!,
@@ -183,70 +185,92 @@
     ): Promise<void> {
         console.time("merlin-total");
 
-        const prompt = interaction.options.getString("input") ?? "hi";
-        const userId = interaction.user.id;
-        const userName = interaction.user.displayName;
+    const prompt = interaction.options.getString("input") ?? "hi";
+    const userId = interaction.user.id;
+    const userName = interaction.user.displayName;
 
-        console.log(
+    console.log(
         `User sent message ${userId} with prompt: ${prompt}`,
-        );
+    );
 
-        const newThread = await channel.threads.create({
+    const newThread = await channel.threads.create({
         name: `[${userName}] - Prompt: ${prompt.slice(0, 40) || "Prompt"}`,
         autoArchiveDuration: ThreadAutoArchiveDuration.OneHour,
         reason: "LLM Bot Auto Created Thread",
-        });
+    });
 
-        this.assignThread(interaction.id, newThread);
+    this.assignThread(interaction.id, newThread);
 
-        try {
+    try {
         console.time("groq-call");
 
+        // 1) Decide if this looks like a web question
+        let webContext = "";
+        if (prompt && looksLikeWebQuestion(prompt)) {
+            console.log("Looks like a web question, calling Tavily...");
+        const web = await searchWebWithTavily(prompt, "news");
+        if (web) {
+            webContext = web;
+        }
+        }
+
+        // 2) Build messages for Groq (Merlin + optional web info)
+        const messages: { role: "system" | "user"; content: string }[] = [
+        { role: "system", content: MERLIN_SYSTEM_PROMPT },
+        ];
+
+        if (webContext) {
+        messages.push({
+            role: "system",
+            content:
+            "Información reciente obtenida de la web. Úsala para responder con precisión, " +
+            "pero mantén tu tono y personalidad de Merlin. Si algo no está claro, dilo honestamente:\n\n" +
+            webContext,
+        });
+        }
+
+        messages.push({
+            role: "user",
+            content: prompt,
+        });
+
+        // 3) Call Groq with Merlin + (maybe) web context
         const completion = await groq.chat.completions.create({
             model: Queue.LLM_MODEL,
-            messages: [
-            {
-                role: "system",
-                content:
-                "You are Merlin. Reply in one short sentence.",
-            },
-            {
-                role: "user",
-                content: prompt,
-            },
-            ],
-            max_tokens: 32,
-            temperature: 0.5,
+            messages,
+            max_tokens: 256,
+            temperature: 0.7,
         });
 
         console.timeEnd("groq-call");
 
         const fullResponse =
-            completion.choices[0]?.message?.content ??
-            "Merlin couldn’t think of anything to say 🧙‍♀️";
+        completion.choices[0]?.message?.content ??
+        "Merlin couldn’t think of anything to say 🧙‍♀️";
 
         await newThread.send(fullResponse);
 
         try {
-            await interaction.deleteReply();
+        await interaction.deleteReply();
         } catch {
-            // ignore
+        // ignore
         }
 
         this.removeItem(interaction.id);
-        } catch (error: unknown) {
+    } catch (error: unknown) {
         console.error("Error while calling Groq:", error);
         await newThread.send(
-            "Merlin ran into an error talking to the model. Try again in a bit 🧙‍♀️",
+        "Merlin ran into an error talking to the model. Try again in a bit 🧙‍♀️",
         );
         await interaction.editReply(
-            "An error occured. Please try again later.",
+        "An error occured. Please try again later.",
         );
         this.removeItem(interaction.id);
-        }
-
-        console.timeEnd("merlin-total");
     }
+
+    console.timeEnd("merlin-total");
+    }
+
     }
 
     export default Queue;
