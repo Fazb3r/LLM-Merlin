@@ -35,7 +35,7 @@ class Queue {
 
     // Default model if GROQ_MODEL not set
     private static readonly LLM_MODEL =
-        process.env.GROQ_MODEL || "llama3-8b-8192";
+        process.env.GROQ_MODEL || "gpt-oss-20b";
 
     constructor() {
         this.queue = {};
