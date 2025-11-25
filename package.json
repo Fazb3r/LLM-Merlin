@@ -15,7 +15,8 @@
   "dependencies": {
     "discord.js": "^14.17.2",
     "dotenv": "^16.4.7",
-    "groq-sdk": "^0.35.0"
+    "groq-sdk": "^0.35.0",
+    "pg": "^8.16.3"
   },
   "devDependencies": {
     "typescript": "^5.7.3"
