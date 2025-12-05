@@ -1,22 +1,23 @@
-// src/messageLogger.ts
+// src/messageLoger.ts
 import { Client, Message, Events } from "discord.js";
-import { insertMessage } from "../src/data/db";
+import { insertMessage } from "./data/db"; 
 
 export function setupMessageLogger(client: Client) {
-client.on(Events.MessageCreate, async (message: Message) => {
-    if (message.author.bot) return; // Ignore bot messages
+  client.on(Events.MessageCreate, async (message: Message) => {
+    if (message.author.bot) return;
 
     try {
-    insertMessage.run(
+      insertMessage.run(
         message.author.id,
         message.author.username,
         message.channelId,
         message.content
-    );
-} catch (err) {
-    console.error("Error inserting message:", err);
+      );
+      console.log("[LOGGER] Saved message from", message.author.username);
+    } catch (err) {
+      console.error("❌ Error inserting message:", err);
     }
-});
+  });
 
-console.log("Message logger active");
+  console.log("📝 Message logger active");
 }
