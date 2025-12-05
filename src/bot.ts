@@ -6,6 +6,8 @@ import fs from "fs";
 import { Client, Collection, Events, GatewayIntentBits, Message } from "discord.js";
 import deployCommands from "./deploy/deployCommands";
 import { MERLIN_SYSTEM_PROMPT } from "./system/system";
+import { setupMessageLogger } from "../src/messageLoger";
+
 import Groq from "groq-sdk";
 import {
     shouldSearchWeb,
@@ -295,3 +297,5 @@ client.login(BOT_TOKEN).catch(err => {
     console.error("Failed to login:", err);
     process.exit(1);
 });
+
+setupMessageLogger(client);
