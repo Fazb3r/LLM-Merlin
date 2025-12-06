@@ -69,33 +69,14 @@ const groq = new Groq({
 });
 
 /**
- * Simple heuristic to choose which Groq model to use.
- * - MAIN_MODEL for code, deep help, or medium/long questions.
- * - LIGHT_MODEL for very short/light messages.
+
+ * For now, always use the main model so Merlin's personality stays consistent.
+ * If you ever want to re-enable a lighter model, you can add logic here again.
  */
-function chooseModel(rawText: string): string {
-  const lower = rawText.toLowerCase();
-
-  const hasCode =
-    /```/.test(rawText) ||
-    /(function|class|#include|SELECT\s+.+\s+FROM)/i.test(rawText);
-
-  const wantsDepth = /(explica|explícame|explain|how does|por qué|step by step|paso a paso)/i.test(
-    lower
-  );
-
-  const isVeryShort = rawText.length < 80;
-
-  if (hasCode || wantsDepth) {
-    return MAIN_MODEL;
-  }
-
-  if (isVeryShort) {
-    return LIGHT_MODEL;
-  }
-
+function chooseModel(_rawText: string): string {
   return MAIN_MODEL;
 }
+
 
 /* -------------------------------------------------------------------------- */
 /*  Discord client + command loader                                           */
