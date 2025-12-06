@@ -62,6 +62,16 @@ const MAIN_MODEL =
   process.env.GROQ_MODEL ||
   "llama-3.3-70b-versatile";
 
+// Secondary model used for complex or deep queries.  While the primary model
+// (llama‑3.3‑70b‑versatile) is generally faster, a larger model such as
+// `openai/gpt‑oss‑120b` can produce more nuanced answers.  We reference an
+// environment variable so deployments can override the default without
+// changing code.  If unspecified, we fall back to the 120b model name
+// explicitly.
+const SECONDARY_MODEL =
+  process.env.GROQ_MODEL_SECONDARY ||
+  "openai/gpt-oss-120b";
+
 const LIGHT_MODEL = process.env.GROQ_MODEL_LIGHT || "llama-3.1-8b-instant";
 
 const groq = new Groq({
@@ -69,12 +79,108 @@ const groq = new Groq({
 });
 
 /**
-
- * For now, always use the main model so Merlin's personality stays consistent.
- * If you ever want to re-enable a lighter model, you can add logic here again.
+ * Detect whether the user's query requires a more in‑depth or nuanced
+ * response.  Longer or more open‑ended questions benefit from the larger
+ * model, whereas short factual queries can be handled by the default model.
+ *
+ * The heuristic looks for the presence of certain keywords (e.g. "why",
+ * "explain", "impact", "significance", etc.) and considers the length of
+ * the input.  These rules can be tuned over time as needed without
+ * introducing additional dependencies.
+ *
+ * @param text The cleaned user message
+ * @returns true if the query is considered deep/complex
  */
-function chooseModel(_rawText: string): string {
-  return MAIN_MODEL;
+function isDeepQuery(text: string): boolean {
+  const lower = text.toLowerCase();
+  const deepKeywords = [
+    "why",
+    "explain",
+    "impact",
+    "consequence",
+    "analysis",
+    "philosophy",
+    "significance",
+    "meaning",
+    "cause",
+    "context",
+    "background",
+    "deep",
+  ];
+
+  // If any deep keyword appears in the message, consider it a deep query
+  for (const kw of deepKeywords) {
+    if (lower.includes(kw)) return true;
+  }
+
+  // Long messages are more likely to require nuanced responses
+  if (text.length > 180) return true;
+  if (text.split(/\s+/).length > 30) return true;
+
+  return false;
+}
+
+/**
+ * Detect whether the user's query is a direct factual question.  A factual
+ * question usually begins with interrogative words (who, what, where, when,
+ * how many, etc.) and tends to be relatively short.  This heuristic allows
+ * us to route these queries to the primary model without invoking the
+ * larger and slower secondary model.
+ *
+ * @param text The cleaned user message
+ * @returns true if the query is considered factual
+ */
+function isFactQuery(text: string): boolean {
+  const lower = text.toLowerCase().trim();
+
+  // Simple patterns for factual queries
+  const factPatterns = [
+    /^who\b/,
+    /^what\b/,
+    /^where\b/,
+    /^when\b/,
+    /^which\b/,
+    /^how many\b/,
+    /^list\b/,
+    /^define\b/,
+  ];
+
+  for (const pattern of factPatterns) {
+    if (pattern.test(lower)) {
+      // Ensure it's not too long – long questions are often open‑ended
+      if (text.length < 160 && text.split(/\s+/).length < 25) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * Choose which language model to use based on the incoming text.  For
+ * straightforward factual questions, the main model (70b) will suffice and
+ * respond quickly.  For deeper or more open‑ended queries, the secondary
+ * model (120b) is preferred.  The heuristic leverages the helper
+ * functions above; if both deep and fact indicators are present, deep takes
+ * precedence.
+ *
+ * If neither model is deemed a better fit, the main model is returned.
+ */
+function chooseModel(rawText: string): string {
+  try {
+    const text = rawText || "";
+    if (isDeepQuery(text)) {
+      return SECONDARY_MODEL;
+    }
+    if (isFactQuery(text)) {
+      return MAIN_MODEL;
+    }
+    // Default: use main model for brevity and speed
+    return MAIN_MODEL;
+  } catch {
+    // On unexpected errors, fall back to the main model
+    return MAIN_MODEL;
+  }
 }
 
 
@@ -329,44 +435,100 @@ const messageHandler = async (message: Message) => {
 
     /* ------------------------ 6) Groq completion ------------------------------ */
 
-    const chosenModel = chooseModel(rawText);
+    // Determine which model to use for this query.  Deep or open‑ended
+    // questions are routed to the secondary model; shorter factual ones go
+    // through the primary model.  A fallback will be attempted if the
+    // primary call fails.
+    const primaryModel = chooseModel(rawText);
+    // Decide the alternative model for fallback based on which one was chosen
+    const fallbackModel =
+      primaryModel === MAIN_MODEL ? SECONDARY_MODEL : MAIN_MODEL;
+
+    let usedModel = primaryModel;
     console.log(
-      `[MODEL] Using ${chosenModel} for message ${message.id} from ${message.author.tag}`
+      `[MODEL] Attempting ${primaryModel} for message ${message.id} from ${message.author.tag}`
     );
 
-    console.time(`[GROQ-${message.id}]`);
-
-    let completion;
-    try {
-      completion = await groq.chat.completions.create({
-        model: chosenModel,
+    // Helper to perform the completion call
+    async function callModel(modelName: string) {
+      return await groq.chat.completions.create({
+        model: modelName,
         messages,
         max_tokens: 512,
         temperature: 0.7,
       });
-    } catch (groqErr: any) {
-      console.error("[GROQ ERROR]", groqErr);
-
-      if (groqErr?.status === 500) {
-        await message.reply(
-          "El servidor de Groq está teniendo problemas. Dame un momento e intenta de nuevo."
-        );
-      } else if (groqErr?.status === 429) {
-        await message.reply(
-          "Demasiadas peticiones. Espera un momento antes de intentar de nuevo."
-        );
-      } else {
-        await message.reply(
-          "Mi núcleo se bugueó un segundo. Intenta otra vez."
-        );
-      }
-      return;
-    } finally {
-      console.timeEnd(`[GROQ-${message.id}]`);
     }
 
+    let completion;
+    // Start a timer for the primary call
+    console.time(`[GROQ-${message.id}-${primaryModel}]`);
+    try {
+      completion = await callModel(primaryModel);
+      // If the primary call succeeds, stop the timer
+      console.timeEnd(`[GROQ-${message.id}-${primaryModel}]`);
+    } catch (groqErr: any) {
+      // End timing for the failed primary attempt
+      console.timeEnd(`[GROQ-${message.id}-${primaryModel}]`);
+      console.error(`[GROQ ERROR][${primaryModel}]`, groqErr);
+      // Attempt the fallback model only if it differs from the primary
+      if (fallbackModel && fallbackModel !== primaryModel) {
+        console.log(
+          `[MODEL] Falling back to ${fallbackModel} for message ${message.id}`
+        );
+        usedModel = fallbackModel;
+        // Start timing for the fallback call
+        console.time(`[GROQ-${message.id}-${fallbackModel}]`);
+        try {
+          completion = await callModel(fallbackModel);
+          console.timeEnd(`[GROQ-${message.id}-${fallbackModel}]`);
+        } catch (fallbackErr: any) {
+          // End timing for the fallback attempt
+          console.timeEnd(`[GROQ-${message.id}-${fallbackModel}]`);
+          console.error(`[GROQ ERROR][${fallbackModel}]`, fallbackErr);
+          // Respond with an error message based on the fallback error status
+          if (fallbackErr?.status === 500) {
+            await message.reply(
+              "El servidor de Groq está teniendo problemas. Dame un momento e intenta de nuevo."
+            );
+          } else if (fallbackErr?.status === 429) {
+            await message.reply(
+              "Demasiadas peticiones. Espera un momento antes de intentar de nuevo."
+            );
+          } else {
+            await message.reply(
+              "Mi núcleo se bugueó un segundo. Intenta otra vez."
+            );
+          }
+          console.log(
+            `[FAILURE] Both models failed for message ${message.id}`
+          );
+          return;
+        }
+      } else {
+        // No fallback available or same as primary – reply with an error
+        if (groqErr?.status === 500) {
+          await message.reply(
+            "El servidor de Groq está teniendo problemas. Dame un momento e intenta de nuevo."
+          );
+        } else if (groqErr?.status === 429) {
+          await message.reply(
+            "Demasiadas peticiones. Espera un momento antes de intentar de nuevo."
+          );
+        } else {
+          await message.reply(
+            "Mi núcleo se bugueó un segundo. Intenta otra vez."
+          );
+        }
+        console.log(
+          `[FAILURE] Model ${primaryModel} failed with no fallback for message ${message.id}`
+        );
+        return;
+      }
+    }
+
+    // We should have a completion at this point
     const replyText =
-      completion.choices[0]?.message?.content?.trim() ??
+      completion?.choices?.[0]?.message?.content?.trim() ??
       "Merlin tried to answer but something went wrong.";
 
     const cleanedReply = stripEmojisExceptYellowHeart(replyText).trim();
@@ -374,7 +536,9 @@ const messageHandler = async (message: Message) => {
     await message.reply(
       cleanedReply || "Estoy aquí, pero no pude generar una respuesta."
     );
-    console.log(`[SUCCESS] Replied to message ${message.id}`);
+    console.log(
+      `[SUCCESS] Replied using ${usedModel} to message ${message.id}`
+    );
   } catch (err) {
     console.error("[UNEXPECTED ERROR] in message handler:", err);
     try {
