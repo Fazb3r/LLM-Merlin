@@ -191,6 +191,8 @@ const getServerDefinitionStmt = db.prepare(`
   LIMIT 1
 `);
 
+
+
 export function getServerDefinition(
   guildId: string,
   term: string
