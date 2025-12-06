@@ -31,7 +31,8 @@ CREATE TABLE IF NOT EXISTS user_facts (
   user_id TEXT NOT NULL,
   key TEXT NOT NULL,
   value TEXT NOT NULL,
-  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS server_lexicon (
@@ -46,6 +47,10 @@ CREATE TABLE IF NOT EXISTS server_lexicon (
   updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   UNIQUE (guild_id, term)
 );
+
+/* Ensure (user_id, key) is unique so we can UPSERT facts */
+CREATE UNIQUE INDEX IF NOT EXISTS idx_user_facts_user_key
+ON user_facts (user_id, key);
 `);
 
 /* ---------- TYPES ---------- */
@@ -72,6 +77,7 @@ export interface UserFactRow {
   key: string;
   value: string;
   created_at: string;
+  updated_at: string;
 }
 
 export interface ServerLexiconRow {
@@ -93,9 +99,18 @@ export const insertMessage = db.prepare(`
   VALUES (?, ?, ?, ?)
 `);
 
+/**
+ * Insert or update a fine-grained user fact.
+ * - If (user_id, key) does not exist → insert new row
+ * - If it exists → update value + updated_at
+ */
 export const insertUserFact = db.prepare(`
-  INSERT INTO user_facts (user_id, key, value)
-  VALUES (?, ?, ?)
+  INSERT INTO user_facts (user_id, key, value, created_at, updated_at)
+  VALUES (?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+  ON CONFLICT(user_id, key)
+  DO UPDATE SET
+    value = excluded.value,
+    updated_at = CURRENT_TIMESTAMP
 `);
 
 export const upsertUserProfile = db.prepare(`
@@ -152,10 +167,10 @@ export function getUserProfile(userId: string): UserProfileRow | null {
 
 // 3) User facts (fine-grained memory)
 const getUserFactsStmt = db.prepare(`
-  SELECT id, user_id, key, value, created_at
+  SELECT id, user_id, key, value, created_at, updated_at
   FROM user_facts
   WHERE user_id = ?
-  ORDER BY created_at DESC
+  ORDER BY updated_at DESC
   LIMIT ?
 `);
 
