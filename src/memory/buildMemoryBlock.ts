@@ -5,7 +5,7 @@ import {
   getUserProfile,
   getUserFacts,
   getServerDefinition,
-  
+
 } from "../data/db";
 
 /**
@@ -112,6 +112,12 @@ export async function buildMemoryBlock(message: Message): Promise<string> {
   }
 
   lines.push("[MEMORY BLOCK END]");
+  const memoryBlock = lines.join("\n");
+  
 
-  return lines.join("\n");
+// 🔎 DEBUG: print the memory block in the server logs
+  console.log("\n[MEMORY BLOCK]\n" + memoryBlock + "\n");
+
+  return memoryBlock;
 }
+
