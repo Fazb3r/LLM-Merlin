@@ -2,14 +2,13 @@
 import Database from "better-sqlite3";
 import path from "path";
 
-// Always point to the same file from the project root,
-// no matter if we run src/ or dist/
 const dbPath = path.resolve(process.cwd(), "src/data/merlin.db");
 console.log("[DB] Using database at:", dbPath);
 
 const db = new Database(dbPath);
 
-// --- TABLE CREATION ---
+/* ---------- TABLES ---------- */
+
 db.exec(`
 CREATE TABLE IF NOT EXISTS messages (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -34,9 +33,60 @@ CREATE TABLE IF NOT EXISTS user_facts (
   value TEXT NOT NULL,
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE TABLE IF NOT EXISTS server_lexicon (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  guild_id TEXT NOT NULL,
+  term TEXT NOT NULL,
+  definition TEXT NOT NULL,
+  taught_by TEXT,
+  source_msg_id TEXT,
+  nsfw INTEGER DEFAULT 0,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE (guild_id, term)
+);
 `);
 
-// --- INSERT FUNCTIONS ---
+/* ---------- TYPES ---------- */
+
+export interface MessageRow {
+  id: number;
+  user_id: string;
+  username: string;
+  channel_id: string;
+  content: string;
+  created_at: string; // ISO string
+}
+
+export interface UserProfileRow {
+  user_id: string;
+  username: string;
+  summary: string | null;
+  updated_at: string;
+}
+
+export interface UserFactRow {
+  id: number;
+  user_id: string;
+  key: string;
+  value: string;
+  created_at: string;
+}
+
+export interface ServerLexiconRow {
+  id: number;
+  guild_id: string;
+  term: string;
+  definition: string;
+  taught_by: string | null;
+  source_msg_id: string | null;
+  nsfw: number;
+  created_at: string;
+  updated_at: string;
+}
+
+/* ---------- WRITE STATEMENTS ---------- */
 
 export const insertMessage = db.prepare(`
   INSERT INTO messages (user_id, username, channel_id, content)
@@ -52,20 +102,84 @@ export const upsertUserProfile = db.prepare(`
   INSERT INTO user_profiles (user_id, username, summary)
   VALUES (@user_id, @username, @summary)
   ON CONFLICT(user_id)
-  DO UPDATE SET summary = @summary, updated_at = CURRENT_TIMESTAMP
+  DO UPDATE SET
+    username = excluded.username,
+    summary = excluded.summary,
+    updated_at = CURRENT_TIMESTAMP
 `);
 
-// --- QUERY HELPERS ---
+export const upsertServerDefinition = db.prepare(`
+  INSERT INTO server_lexicon (guild_id, term, definition, taught_by, source_msg_id, nsfw)
+  VALUES (@guild_id, @term, @definition, @taught_by, @source_msg_id, @nsfw)
+  ON CONFLICT(guild_id, term)
+  DO UPDATE SET
+    definition = excluded.definition,
+    taught_by = excluded.taught_by,
+    source_msg_id = excluded.source_msg_id,
+    nsfw = excluded.nsfw,
+    updated_at = CURRENT_TIMESTAMP
+`);
 
-export const getRecentMessages = db.prepare(`
-  SELECT username, content, created_at
+/* ---------- READ HELPERS (RAG) ---------- */
+
+// 1) Recent messages in a channel (for short-term context)
+const getRecentMessagesStmt = db.prepare(`
+  SELECT id, user_id, username, channel_id, content, created_at
   FROM messages
   WHERE channel_id = ?
   ORDER BY created_at DESC
   LIMIT ?
 `);
 
-export const getUserProfile = db.prepare(`
-  SELECT * FROM user_profiles
+export function getRecentMessages(
+  channelId: string,
+  limit: number
+): MessageRow[] {
+  return getRecentMessagesStmt.all(channelId, limit) as MessageRow[];
+}
+
+// 2) User profile summary (long-term identity)
+const getUserProfileStmt = db.prepare(`
+  SELECT user_id, username, summary, updated_at
+  FROM user_profiles
   WHERE user_id = ?
 `);
+
+export function getUserProfile(userId: string): UserProfileRow | null {
+  const row = getUserProfileStmt.get(userId);
+  return (row as UserProfileRow) || null;
+}
+
+// 3) User facts (fine-grained memory)
+const getUserFactsStmt = db.prepare(`
+  SELECT id, user_id, key, value, created_at
+  FROM user_facts
+  WHERE user_id = ?
+  ORDER BY created_at DESC
+  LIMIT ?
+`);
+
+export function getUserFacts(
+  userId: string,
+  limit: number
+): UserFactRow[] {
+  return getUserFactsStmt.all(userId, limit) as UserFactRow[];
+}
+
+// 4) Server-specific definition (slang / inside jokes)
+const getServerDefinitionStmt = db.prepare(`
+  SELECT *
+  FROM server_lexicon
+  WHERE guild_id = ?
+    AND LOWER(term) = LOWER(?)
+  ORDER BY updated_at DESC
+  LIMIT 1
+`);
+
+export function getServerDefinition(
+  guildId: string,
+  term: string
+): ServerLexiconRow | null {
+  const row = getServerDefinitionStmt.get(guildId, term);
+  return (row as ServerLexiconRow) || null;
+}

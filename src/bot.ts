@@ -4,16 +4,19 @@ require("dotenv").config();
 import path from "path";
 import fs from "fs";
 import { Client, Collection, Events, GatewayIntentBits, Message } from "discord.js";
-import deployCommands from "./deploy/deployCommands";
-import { MERLIN_SYSTEM_PROMPT } from "./system/system";
-import { setupMessageLogger } from "./messageLoger"
+import { setupMessageLogger } from "./messageLoger";
 import Groq from "groq-sdk";
+import { buildMemoryBlock } from "./memory/buildMemoryBlock";
+import { MERLIN_SYSTEM_PROMPT, MEMORY_USAGE_RULES } from "./system/system";
+import { extractTeachingFromMessage } from "./utils/teachingDetector";
+
 import {
     shouldSearchWeb,
     searchWebWithTavily,
     looksLikeCurrentEventQuestion,
     getSuggestedSearchMessage,
 } from "./utils/webSearch";
+import { upsertServerDefinition } from "./data/db";
 
 // Utilidad para eliminar emojis de cualquier respuesta
 function stripEmojis(text: string): string {
@@ -44,16 +47,18 @@ const client = new Client({
 // Track processed messages with timestamp to prevent duplicates
 const processedMessages = new Map<string, number>();
 
-// Clean up old message IDs every 30 minutes (increased from 5 minutes)
+// Clean up old message IDs every 30 minutes
 // Only remove messages older than 1 hour
 setInterval(() => {
-    const oneHourAgo = Date.now() - (60 * 60 * 1000);
+    const oneHourAgo = Date.now() - 60 * 60 * 1000;
     for (const [messageId, timestamp] of processedMessages.entries()) {
         if (timestamp < oneHourAgo) {
             processedMessages.delete(messageId);
         }
     }
-    console.log(`Cleaned up old messages. Current cache size: ${processedMessages.size}`);
+    console.log(
+        `Cleaned up old messages. Current cache size: ${processedMessages.size}`
+    );
 }, 30 * 60 * 1000);
 
 // @ts-ignore – extensión custom
@@ -72,6 +77,7 @@ for (const folder of commandFolders) {
         const filePath = path.join(commandsPath, file);
         const command = require(filePath);
         if ("data" in command && "execute" in command) {
+            // @ts-ignore
             client.commands.set(command.data.name, command);
         } else {
             console.log(
@@ -89,6 +95,7 @@ client.once(Events.ClientReady, () => {
 
 client.on(Events.InteractionCreate, async (interaction) => {
     if (!interaction.isChatInputCommand()) return;
+    // @ts-ignore
     const command = interaction.client.commands.get(interaction.commandName);
 
     if (!command) {
@@ -126,13 +133,20 @@ const messageHandler = async (message: Message) => {
 
         // 2) Prevent processing the same message twice with timestamp check
         if (processedMessages.has(message.id)) {
-            console.log(`[DUPLICATE BLOCKED] Message ${message.id} from ${message.author.tag}`);
+            console.log(
+                `[DUPLICATE BLOCKED] Message ${message.id} from ${message.author.tag}`
+            );
             return;
         }
-        
+
         // Mark as processed immediately with timestamp
         processedMessages.set(message.id, Date.now());
-        console.log(`[PROCESSING] Message ${message.id} from ${message.author.tag}: "${message.content.substring(0, 50)}..."`);
+        console.log(
+            `[PROCESSING] Message ${message.id} from ${message.author.tag}: "${message.content.substring(
+                0,
+                50
+            )}..."`
+        );
 
         const isDM = !message.guild;
         const botUser = client.user;
@@ -174,38 +188,71 @@ const messageHandler = async (message: Message) => {
             return;
         }
 
+        // --- Teaching detector: check if the user is teaching Merlin a server concept ---
+if (message.guild) {
+    const teaching = extractTeachingFromMessage(rawText);
+    if (teaching) {
+        try {
+            upsertServerDefinition.run({
+                guild_id: message.guild.id,
+                term: teaching.term,
+                definition: teaching.definition,
+                taught_by: message.author.id,
+                source_msg_id: message.id,
+                nsfw: 0, // later you can classify this
+            });
+            console.log(
+                `[TEACHING] Stored/updated term "${teaching.term}" for guild ${message.guild.id}`
+            );
+        } catch (err) {
+            console.error("[TEACHING ERROR] Could not store server_lexicon term:", err);
+        }
+    }
+}
+
+
         console.time(`[GROQ-${message.id}]`);
 
         // 5) Check if web search is needed
         let webContext = "";
-        
+
         if (shouldSearchWeb(rawText)) {
-            console.log(`[WEB SEARCH] Explicit search detected for message ${message.id}`);
+            console.log(
+                `[WEB SEARCH] Explicit search detected for message ${message.id}`
+            );
             try {
                 const web = await searchWebWithTavily(rawText, "general");
                 if (web) {
                     webContext = web;
-                    console.log(`[WEB SEARCH] Success - got ${web.length} chars of context`);
+                    console.log(
+                        `[WEB SEARCH] Success - got ${web.length} chars of context`
+                    );
                 } else {
                     console.log(`[WEB SEARCH] No results found`);
                     await message.reply(
                         stripEmojis(
                             "Intenté buscar eso pero no encontré resultados confiables. " +
-                            "Puede que la información no esté disponible o que necesite reformular la búsqueda."
+                                "Puede que la información no esté disponible o que necesite reformular la búsqueda."
                         )
                     );
                     return;
                 }
             } catch (searchErr) {
                 console.error(`[WEB SEARCH ERROR]`, searchErr);
-                await message.reply("Tuve problemas conectando con la búsqueda web. Intenta de nuevo.");
+                await message.reply(
+                    "Tuve problemas conectando con la búsqueda web. Intenta de nuevo."
+                );
                 return;
             }
         }
 
-        // 6) Build messages for Groq
+        // 6) Build messages and MEMORY BLOCK for Groq (RAG)
+        const memoryBlock = await buildMemoryBlock(message);
+
         const messages: { role: "system" | "user"; content: string }[] = [
             { role: "system", content: MERLIN_SYSTEM_PROMPT },
+            { role: "system", content: MEMORY_USAGE_RULES },
+            { role: "system", content: memoryBlock },
         ];
 
         if (webContext) {
@@ -231,7 +278,7 @@ const messageHandler = async (message: Message) => {
             });
         } catch (groqErr: any) {
             console.error(`[GROQ ERROR]`, groqErr);
-            
+
             if (groqErr?.status === 500) {
                 await message.reply(
                     "El servidor de Groq está teniendo problemas. Dame un momento e intenta de nuevo."
@@ -257,9 +304,11 @@ const messageHandler = async (message: Message) => {
         const cleanedReply = stripEmojis(replyText);
 
         // 8) Send the reply
-        await message.reply(cleanedReply || "I am here, but I was unable to compose a response.");
+        await message.reply(
+            cleanedReply ||
+                "I am here, but I was unable to compose a response."
+        );
         console.log(`[SUCCESS] Replied to message ${message.id}`);
-
     } catch (err) {
         console.error(`[UNEXPECTED ERROR] in message handler:`, err);
         // Only try to reply if we haven't processed this message successfully
@@ -270,7 +319,10 @@ const messageHandler = async (message: Message) => {
                 );
             }
         } catch (replyErr) {
-            console.error(`[REPLY ERROR] Could not send error message:`, replyErr);
+            console.error(
+                `[REPLY ERROR] Could not send error message:`,
+                replyErr
+            );
         }
     }
 };
@@ -279,14 +331,14 @@ const messageHandler = async (message: Message) => {
 client.on(Events.MessageCreate, messageHandler);
 
 // Graceful shutdown
-process.on('SIGINT', () => {
-    console.log('Shutting down gracefully...');
+process.on("SIGINT", () => {
+    console.log("Shutting down gracefully...");
     client.destroy();
     process.exit(0);
 });
 
-process.on('SIGTERM', () => {
-    console.log('Shutting down gracefully...');
+process.on("SIGTERM", () => {
+    console.log("Shutting down gracefully...");
     client.destroy();
     process.exit(0);
 });
@@ -294,8 +346,7 @@ process.on('SIGTERM', () => {
 setupMessageLogger(client);
 
 // Log in with the bot's token.
-client.login(BOT_TOKEN).catch(err => {
+client.login(BOT_TOKEN).catch((err) => {
     console.error("Failed to login:", err);
     process.exit(1);
 });
-
