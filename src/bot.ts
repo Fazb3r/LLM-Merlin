@@ -10,183 +10,82 @@ import {
   GatewayIntentBits,
   Message,
 } from "discord.js";
-
 import Groq from "groq-sdk";
 
 import { setupMessageLogger } from "./messageLoger";
 import { buildMemoryBlock } from "./memory/buildMemoryBlock";
 import { MERLIN_SYSTEM_PROMPT, MEMORY_USAGE_RULES } from "./system/system";
-
 import { detectAndStoreTeaching } from "./utils/teachingDetector";
-import { detectFactWithLLM } from "./memory/factDetector";
-import { insertUserFact } from "./data/db";
 
 import {
   shouldSearchWeb,
   searchWebWithTavily,
-  looksLikeCurrentEventQuestion,
-  getSuggestedSearchMessage,
 } from "./utils/webSearch";
 
-/* -------------------------------------------------------------------------- */
-/*  Emoji handling                                                            */
-/* -------------------------------------------------------------------------- */
-
-/**
- * Remove all emojis except the yellow heart 💛.
- */
-function stripEmojisExceptYellowHeart(text: string): string {
-  const placeholder = "__YELLOW_HEART__";
-
-  // Temporarily protect 💛
-  const protectedText = text.replace(/💛/g, placeholder);
-
-  // Remove all other emojis
-  const withoutEmoji = protectedText.replace(
+/* ------------------------------------------------------------------ */
+/* Utility: strip ALL emojis except we later allow Merlin to send 💛   */
+/* (but the model itself tends to inject emojis, so we sanitize here). */
+/* ------------------------------------------------------------------ */
+function stripEmojis(text: string): string {
+  return text.replace(
     /[\u{1F300}-\u{1F6FF}\u{1F900}-\u{1F9FF}\u{1FA70}-\u{1FAFF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}]/gu,
     ""
   );
-
-  // Restore 💛
-  return withoutEmoji.replace(new RegExp(placeholder, "g"), "💛");
 }
 
-/* -------------------------------------------------------------------------- */
-/*  Environment & Groq setup                                                  */
-/* -------------------------------------------------------------------------- */
+/* ------------------------------------------------------------------ */
+/* Groq client + model selection                                      */
+/* ------------------------------------------------------------------ */
 
-const BOT_TOKEN = process.env.DISCORD_LLM_BOT_TOKEN;
-
-const MAIN_MODEL =
-  process.env.GROQ_MODEL_MAIN ||
-  process.env.GROQ_MODEL ||
-  "llama-3.3-70b-versatile";
-
-// Secondary model used for complex or deep queries.  While the primary model
-// (llama‑3.3‑70b‑versatile) is generally faster, a larger model such as
-// `openai/gpt‑oss‑120b` can produce more nuanced answers.  We reference an
-// environment variable so deployments can override the default without
-// changing code.  If unspecified, we fall back to the 120b model name
-// explicitly.
-const SECONDARY_MODEL =
-  process.env.GROQ_MODEL_SECONDARY ||
-  "openai/gpt-oss-120b";
-
-const LIGHT_MODEL = process.env.GROQ_MODEL_LIGHT || "llama-3.1-8b-instant";
+const PRIMARY_MODEL = "llama-3.3-70b-versatile";
+const FALLBACK_MODEL = "openai/gpt-oss-120b";
 
 const groq = new Groq({
   apiKey: process.env.GROQ_API_KEY!,
 });
 
 /**
- * Detect whether the user's query requires a more in‑depth or nuanced
- * response.  Longer or more open‑ended questions benefit from the larger
- * model, whereas short factual queries can be handled by the default model.
- *
- * The heuristic looks for the presence of certain keywords (e.g. "why",
- * "explain", "impact", "significance", etc.) and considers the length of
- * the input.  These rules can be tuned over time as needed without
- * introducing additional dependencies.
- *
- * @param text The cleaned user message
- * @returns true if the query is considered deep/complex
+ * Heuristic: decide which model to *try first*.
+ * - Use PRIMARY_MODEL for most things (fast & strong).
+ * - Use FALLBACK_MODEL only when:
+ *   - The question is long / multi-paragraph.
+ *   - Or looks like “deep analysis / explanation” work.
  */
-function isDeepQuery(text: string): boolean {
-  const lower = text.toLowerCase();
+function chooseModel(rawText: string, memoryBlock: string): string {
+  const text = rawText.toLowerCase();
+  const lengthScore = rawText.length + memoryBlock.length;
+
   const deepKeywords = [
-    "why",
+    "explica",
+    "explícame",
     "explain",
-    "impact",
-    "consequence",
-    "analysis",
-    "philosophy",
-    "significance",
-    "meaning",
-    "cause",
-    "context",
-    "background",
-    "deep",
+    "analyze",
+    "analiza",
+    "dime en detalle",
+    "detailed",
+    "why",
+    "por qué",
+    "porque",
+    "compar",
+    "tradeoff",
+    "matemática",
+    "proof",
+    "demostración",
   ];
 
-  // If any deep keyword appears in the message, consider it a deep query
-  for (const kw of deepKeywords) {
-    if (lower.includes(kw)) return true;
-  }
+  const isDeep =
+    deepKeywords.some((k) => text.includes(k)) || lengthScore > 2500;
 
-  // Long messages are more likely to require nuanced responses
-  if (text.length > 180) return true;
-  if (text.split(/\s+/).length > 30) return true;
-
-  return false;
+  // Most of the time we keep 70B; 120B is for “heavy” queries.
+  if (isDeep) return FALLBACK_MODEL;
+  return PRIMARY_MODEL;
 }
 
-/**
- * Detect whether the user's query is a direct factual question.  A factual
- * question usually begins with interrogative words (who, what, where, when,
- * how many, etc.) and tends to be relatively short.  This heuristic allows
- * us to route these queries to the primary model without invoking the
- * larger and slower secondary model.
- *
- * @param text The cleaned user message
- * @returns true if the query is considered factual
- */
-function isFactQuery(text: string): boolean {
-  const lower = text.toLowerCase().trim();
+/* ------------------------------------------------------------------ */
+/* Discord client setup                                               */
+/* ------------------------------------------------------------------ */
 
-  // Simple patterns for factual queries
-  const factPatterns = [
-    /^who\b/,
-    /^what\b/,
-    /^where\b/,
-    /^when\b/,
-    /^which\b/,
-    /^how many\b/,
-    /^list\b/,
-    /^define\b/,
-  ];
-
-  for (const pattern of factPatterns) {
-    if (pattern.test(lower)) {
-      // Ensure it's not too long – long questions are often open‑ended
-      if (text.length < 160 && text.split(/\s+/).length < 25) {
-        return true;
-      }
-    }
-  }
-  return false;
-}
-
-/**
- * Choose which language model to use based on the incoming text.  For
- * straightforward factual questions, the main model (70b) will suffice and
- * respond quickly.  For deeper or more open‑ended queries, the secondary
- * model (120b) is preferred.  The heuristic leverages the helper
- * functions above; if both deep and fact indicators are present, deep takes
- * precedence.
- *
- * If neither model is deemed a better fit, the main model is returned.
- */
-function chooseModel(rawText: string): string {
-  try {
-    const text = rawText || "";
-    if (isDeepQuery(text)) {
-      return SECONDARY_MODEL;
-    }
-    if (isFactQuery(text)) {
-      return MAIN_MODEL;
-    }
-    // Default: use main model for brevity and speed
-    return MAIN_MODEL;
-  } catch {
-    // On unexpected errors, fall back to the main model
-    return MAIN_MODEL;
-  }
-}
-
-
-/* -------------------------------------------------------------------------- */
-/*  Discord client + command loader                                           */
-/* -------------------------------------------------------------------------- */
+const BOT_TOKEN = process.env.DISCORD_LLM_BOT_TOKEN;
 
 const client = new Client({
   intents: [
@@ -197,41 +96,60 @@ const client = new Client({
   ],
 });
 
-// @ts-ignore – custom extension for commands
+// @ts-ignore – extend client with commands
 client.commands = new Collection();
 
-// Load slash commands
+/* Load slash commands (unchanged) */
 const foldersPath = path.join(__dirname, "commands");
-const commandFolders = fs.readdirSync(foldersPath);
+if (fs.existsSync(foldersPath)) {
+  const commandFolders = fs.readdirSync(foldersPath);
+  for (const folder of commandFolders) {
+    const commandsPath = path.join(foldersPath, folder);
+    if (!fs.existsSync(commandsPath)) continue;
 
-for (const folder of commandFolders) {
-  const commandsPath = path.join(foldersPath, folder);
-  const commandFiles = fs
-    .readdirSync(commandsPath)
-    .filter((file) => file.endsWith(".js"));
+    const commandFiles = fs
+      .readdirSync(commandsPath)
+      .filter((file) => file.endsWith(".js"));
 
-  for (const file of commandFiles) {
-    const filePath = path.join(commandsPath, file);
-    const command = require(filePath);
-    if ("data" in command && "execute" in command) {
-      // @ts-ignore
-      client.commands.set(command.data.name, command);
-    } else {
-      console.log(
-        `[WARNING] The command at ${filePath} is missing "data" or "execute".`
-      );
+    for (const file of commandFiles) {
+      const filePath = path.join(commandsPath, file);
+      const command = require(filePath);
+      if ("data" in command && "execute" in command) {
+        // @ts-ignore
+        client.commands.set(command.data.name, command);
+      } else {
+        console.log(
+          `[WARNING] The command at ${filePath} is missing "data" or "execute".`
+        );
+      }
     }
   }
 }
+
+/* ------------------------------------------------------------------ */
+/* De-dupe messages (avoid double processing)                         */
+/* ------------------------------------------------------------------ */
+
+const processedMessages = new Map<string, number>();
+
+setInterval(() => {
+  const oneHourAgo = Date.now() - 60 * 60 * 1000;
+  for (const [id, ts] of processedMessages.entries()) {
+    if (ts < oneHourAgo) processedMessages.delete(id);
+  }
+  console.log(
+    `[CACHE] Cleaned old messages. Size: ${processedMessages.size}`
+  );
+}, 30 * 60 * 1000);
+
+/* ------------------------------------------------------------------ */
+/* Client events                                                      */
+/* ------------------------------------------------------------------ */
 
 client.once(Events.ClientReady, () => {
   console.log("Bot is online!");
   console.log(`Logged in as ${client.user?.tag}`);
 });
-
-/* -------------------------------------------------------------------------- */
-/*  Interaction handler (slash commands)                                      */
-/* -------------------------------------------------------------------------- */
 
 client.on(Events.InteractionCreate, async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
@@ -239,7 +157,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
   // @ts-ignore
   const command = interaction.client.commands.get(interaction.commandName);
   if (!command) {
-    console.error(`No command matching ${interaction.commandName} was found.`);
+    console.error(
+      `No command matching ${interaction.commandName} was found.`
+    );
     return;
   }
 
@@ -259,33 +179,19 @@ client.on(Events.InteractionCreate, async (interaction) => {
   }
 });
 
-/* -------------------------------------------------------------------------- */
-/*  Message handler                                                           */
-/* -------------------------------------------------------------------------- */
-
-// Track processed messages to avoid duplicates
-const processedMessages = new Map<string, number>();
-
-// Clean cache every 30 minutes (drop entries older than 1 hour)
-setInterval(() => {
-  const oneHourAgo = Date.now() - 60 * 60 * 1000;
-  for (const [id, ts] of processedMessages.entries()) {
-    if (ts < oneHourAgo) processedMessages.delete(id);
-  }
-  console.log(
-    `Cleaned up old messages. Cache size: ${processedMessages.size}`
-  );
-}, 30 * 60 * 1000);
+/* ------------------------------------------------------------------ */
+/* Main message handler                                               */
+/* ------------------------------------------------------------------ */
 
 const messageHandler = async (message: Message) => {
   try {
-    // Ignore bots (including Merlin herself)
+    /* 1) ignore bots */
     if (message.author.bot) return;
 
-    // Deduplicate
+    /* 2) dedupe */
     if (processedMessages.has(message.id)) {
       console.log(
-        `[DUPLICATE BLOCKED] Message ${message.id} from ${message.author.tag}`
+        `[DUPLICATE] Skipping message ${message.id} from ${message.author.tag}`
       );
       return;
     }
@@ -298,67 +204,28 @@ const messageHandler = async (message: Message) => {
       )}..."`
     );
 
+    const isDM = !message.guild;
     const botUser = client.user;
     if (!botUser) return;
 
-    const isDM = !message.guild;
-    const lower = message.content.toLowerCase();
+    const contentLower = message.content.toLowerCase();
 
-    /* ------------------------ 1) Passive learning first ------------------------ */
-
-    // 1a) Rule-based teaching detector (server lexicon + simple patterns)
-    try {
-      await detectAndStoreTeaching(message);
-    } catch (err) {
-      console.error("[TEACHING DETECTOR ERROR]", err);
-    }
-
-    // 1b) LLM-based personal fact detector (only for short messages)
-    try {
-      if (message.content.length <= 280) {
-        const fact = await detectFactWithLLM(message);
-        if (fact && fact.should_store && fact.key && fact.value) {
-          let targetUserId = message.author.id;
-
-          if (fact.target === "other" && fact.target_user_id) {
-            const mentioned = message.mentions.users.get(fact.target_user_id);
-            if (mentioned) {
-              targetUserId = mentioned.id;
-            }
-          }
-
-          insertUserFact.run(targetUserId, fact.key, fact.value);
-          console.log(
-            "[FACT][STORED]",
-            "user:",
-            targetUserId,
-            "key:",
-            fact.key,
-            "value:",
-            fact.value
-          );
-        }
-      }
-    } catch (err) {
-      console.error("[FACT DETECTOR ERROR]", err);
-    }
-
-    /* ------------------------ 2) Decide if Merlin replies ---------------------- */
-
+    /* 3) decide if Merlin should reply */
     let shouldAnswer = false;
 
     if (isDM) {
       shouldAnswer = true;
     } else {
       const mentionedMe = message.mentions.has(botUser);
-      const saidMerlin = lower.includes("merlin");
+      const saidMerlin = contentLower.includes("merlin");
       const saidMer =
-        lower.startsWith("mer ") ||
-        lower.startsWith("mer,") ||
-        lower.startsWith("mer:") ||
-        lower === "mer";
+        contentLower.startsWith("mer ") ||
+        contentLower.startsWith("mer,") ||
+        contentLower.startsWith("mer:") ||
+        contentLower === "mer";
       const saidMerlina =
-        lower.includes("merlina") || lower.startsWith("merlina");
+        contentLower.includes("merlina") ||
+        contentLower.startsWith("merlina");
 
       if (mentionedMe || saidMerlin || saidMer || saidMerlina) {
         shouldAnswer = true;
@@ -366,185 +233,159 @@ const messageHandler = async (message: Message) => {
     }
 
     if (!shouldAnswer) {
-      console.log("[SKIPPED] Not addressed to Merlin");
+      console.log("[SKIPPED] Not addressed to Merlin.");
+      // Still log messages for memory logger via setupMessageLogger
       return;
     }
 
-    /* ------------------------ 3) Clean raw text ------------------------------- */
-
+    /* 4) clean text (remove @mention) */
     const rawText = message.content.replace(/<@!?\d+>/g, "").trim();
     if (!rawText) {
       await message.reply(`¿Sí, ${message.author.username}?`);
       return;
     }
 
-    /* ------------------------ 4) Optional web search -------------------------- */
+    /* 5) run teaching detector (facts + server lexicon) */
+    const teachingResult = detectAndStoreTeaching(message);
+    if (teachingResult) {
+      if (teachingResult.kind === "user_fact") {
+        console.log(
+          `[FACT][STORED] user: ${teachingResult.targetUserId} key: ${teachingResult.key} value: ${teachingResult.value}`
+        );
+      } else if (teachingResult.kind === "server_term") {
+        console.log(
+          `[TEACHING] Stored server_term "${teachingResult.term}" for guild ${message.guildId}`
+        );
+      }
+    }
 
+    /* 6) optional web search */
     let webContext = "";
 
-    if (shouldSearchWeb(rawText) || looksLikeCurrentEventQuestion(rawText)) {
+    if (shouldSearchWeb(rawText)) {
       console.log(
-        `[WEB SEARCH] Triggered for message ${message.id} – "${rawText.slice(
-          0,
-          80
-        )}..."`
+        `[WEB] Search triggered for message ${message.id}`
       );
       try {
         const web = await searchWebWithTavily(rawText, "general");
         if (web) {
           webContext = web;
           console.log(
-            `[WEB SEARCH] Success, context length: ${webContext.length} chars`
+            `[WEB] Got ${web.length} chars of context`
           );
         } else {
-          console.log("[WEB SEARCH] No results");
-          const msg = getSuggestedSearchMessage(rawText);
-          await message.reply(stripEmojisExceptYellowHeart(msg));
+          console.log("[WEB] No useful results");
+          await message.reply(
+            stripEmojis(
+              "Intenté buscar eso pero no encontré resultados confiables. " +
+                "Puede que la info no esté disponible o que haya que reformular la pregunta."
+            )
+          );
           return;
         }
       } catch (err) {
-        console.error("[WEB SEARCH ERROR]", err);
+        console.error("[WEB ERROR]", err);
         await message.reply(
-          "Tuve problemas conectando con la búsqueda web. Intenta de nuevo."
+          "Tuve problemas conectando con la búsqueda web. Intenta de nuevo más tarde."
         );
         return;
       }
     }
 
-    /* ------------------------ 5) Build MEMORY BLOCK --------------------------- */
-
+    /* 7) Build MEMORY BLOCK (RAG: messages, user_facts, profiles, server_lexicon) */
     const memoryBlock = await buildMemoryBlock(message);
+    console.log("[MEMORY BLOCK] built.");
 
-    const messages: { role: "system" | "user"; content: string }[] = [
+    /* 8) Compose messages for Groq */
+    const messagesForGroq: { role: "system" | "user"; content: string }[] = [
       { role: "system", content: MERLIN_SYSTEM_PROMPT },
       { role: "system", content: MEMORY_USAGE_RULES },
       { role: "system", content: memoryBlock },
     ];
 
     if (webContext) {
-      messages.push({
+      messagesForGroq.push({
         role: "system",
         content:
-          "Información reciente obtenida de la web. Úsala para responder con precisión " +
-          "sin perder tu estilo y personalidad. Si algo no está claro, dilo honestamente.\n\n" +
+          "Información reciente obtenida de la web. Úsala para responder con precisión, " +
+          "pero mantén tu estilo y personalidad de Merlin. Si algo no está claro, dilo honestamente:\n\n" +
           webContext,
       });
     }
 
-    messages.push({ role: "user", content: rawText });
+    messagesForGroq.push({ role: "user", content: rawText });
 
-    /* ------------------------ 6) Groq completion ------------------------------ */
+    /* 9) Call Groq with model selection + fallback */
+    console.time(`[GROQ-${message.id}]`);
 
-    // Determine which model to use for this query.  Deep or open‑ended
-    // questions are routed to the secondary model; shorter factual ones go
-    // through the primary model.  A fallback will be attempted if the
-    // primary call fails.
-    const primaryModel = chooseModel(rawText);
-    // Decide the alternative model for fallback based on which one was chosen
-    const fallbackModel =
-      primaryModel === MAIN_MODEL ? SECONDARY_MODEL : MAIN_MODEL;
+    let modelToUse = chooseModel(rawText, memoryBlock);
+    let completion;
 
-    let usedModel = primaryModel;
-    console.log(
-      `[MODEL] Attempting ${primaryModel} for message ${message.id} from ${message.author.tag}`
-    );
-
-    // Helper to perform the completion call
-    async function callModel(modelName: string) {
-      return await groq.chat.completions.create({
-        model: modelName,
-        messages,
+    try {
+      completion = await groq.chat.completions.create({
+        model: modelToUse,
+        messages: messagesForGroq,
         max_tokens: 512,
         temperature: 0.7,
       });
-    }
+      console.log(
+        `[MODEL] Using ${modelToUse} for message ${message.id}`
+      );
+    } catch (err: any) {
+      console.error("[GROQ ERROR - first attempt]", err);
 
-    let completion;
-    // Start a timer for the primary call
-    console.time(`[GROQ-${message.id}-${primaryModel}]`);
-    try {
-      completion = await callModel(primaryModel);
-      // If the primary call succeeds, stop the timer
-      console.timeEnd(`[GROQ-${message.id}-${primaryModel}]`);
-    } catch (groqErr: any) {
-      // End timing for the failed primary attempt
-      console.timeEnd(`[GROQ-${message.id}-${primaryModel}]`);
-      console.error(`[GROQ ERROR][${primaryModel}]`, groqErr);
-      // Attempt the fallback model only if it differs from the primary
-      if (fallbackModel && fallbackModel !== primaryModel) {
+      // Try once with the other model, if available
+      const alternateModel =
+        modelToUse === PRIMARY_MODEL ? FALLBACK_MODEL : PRIMARY_MODEL;
+
+      try {
+        completion = await groq.chat.completions.create({
+          model: alternateModel,
+          messages: messagesForGroq,
+          max_tokens: 512,
+          temperature: 0.7,
+        });
         console.log(
-          `[MODEL] Falling back to ${fallbackModel} for message ${message.id}`
+          `[MODEL] Fallback to ${alternateModel} for message ${message.id}`
         );
-        usedModel = fallbackModel;
-        // Start timing for the fallback call
-        console.time(`[GROQ-${message.id}-${fallbackModel}]`);
-        try {
-          completion = await callModel(fallbackModel);
-          console.timeEnd(`[GROQ-${message.id}-${fallbackModel}]`);
-        } catch (fallbackErr: any) {
-          // End timing for the fallback attempt
-          console.timeEnd(`[GROQ-${message.id}-${fallbackModel}]`);
-          console.error(`[GROQ ERROR][${fallbackModel}]`, fallbackErr);
-          // Respond with an error message based on the fallback error status
-          if (fallbackErr?.status === 500) {
-            await message.reply(
-              "El servidor de Groq está teniendo problemas. Dame un momento e intenta de nuevo."
-            );
-          } else if (fallbackErr?.status === 429) {
-            await message.reply(
-              "Demasiadas peticiones. Espera un momento antes de intentar de nuevo."
-            );
-          } else {
-            await message.reply(
-              "Mi núcleo se bugueó un segundo. Intenta otra vez."
-            );
-          }
-          console.log(
-            `[FAILURE] Both models failed for message ${message.id}`
-          );
-          return;
-        }
-      } else {
-        // No fallback available or same as primary – reply with an error
-        if (groqErr?.status === 500) {
+      } catch (err2: any) {
+        console.error("[GROQ ERROR - fallback]", err2);
+
+        if (err2?.status === 500) {
           await message.reply(
-            "El servidor de Groq está teniendo problemas. Dame un momento e intenta de nuevo."
+            "El servidor de Groq está teniendo problemas. Intenta de nuevo en un momento."
           );
-        } else if (groqErr?.status === 429) {
+        } else if (err2?.status === 429) {
           await message.reply(
-            "Demasiadas peticiones. Espera un momento antes de intentar de nuevo."
+            "Estamos al límite de peticiones por ahora. Prueba de nuevo en un rato."
           );
         } else {
           await message.reply(
-            "Mi núcleo se bugueó un segundo. Intenta otra vez."
+            "Mi núcleo se bugueó un momento. Intenta otra vez."
           );
         }
-        console.log(
-          `[FAILURE] Model ${primaryModel} failed with no fallback for message ${message.id}`
-        );
         return;
       }
     }
 
-    // We should have a completion at this point
-    const replyText =
-      completion?.choices?.[0]?.message?.content?.trim() ??
-      "Merlin tried to answer but something went wrong.";
+    console.timeEnd(`[GROQ-${message.id}]`);
 
-    const cleanedReply = stripEmojisExceptYellowHeart(replyText).trim();
+    const replyText =
+      completion?.choices[0]?.message?.content?.trim() ??
+      "Merlin intentó responder, pero algo salió mal.";
+
+    const cleanedReply = stripEmojis(replyText);
 
     await message.reply(
       cleanedReply || "Estoy aquí, pero no pude generar una respuesta."
     );
-    console.log(
-      `[SUCCESS] Replied using ${usedModel} to message ${message.id}`
-    );
+    console.log(`[SUCCESS] Replied to message ${message.id}`);
   } catch (err) {
     console.error("[UNEXPECTED ERROR] in message handler:", err);
     try {
       if (!message.author.bot) {
         await message.reply(
-          "Mi núcleo se bugueó un segundo. Intenta otra vez."
+          "Algo raro pasó con mi núcleo. Intenta de nuevo, por favor."
         );
       }
     } catch (replyErr) {
@@ -553,12 +394,10 @@ const messageHandler = async (message: Message) => {
   }
 };
 
-/* -------------------------------------------------------------------------- */
-/*  Register handlers & start                                                 */
-/* -------------------------------------------------------------------------- */
-
+/* Register message listener */
 client.on(Events.MessageCreate, messageHandler);
 
+/* Graceful shutdown */
 process.on("SIGINT", () => {
   console.log("Shutting down gracefully (SIGINT)...");
   client.destroy();
@@ -571,6 +410,7 @@ process.on("SIGTERM", () => {
   process.exit(0);
 });
 
+/* Setup logger + login */
 setupMessageLogger(client);
 
 client.login(BOT_TOKEN).catch((err) => {
