@@ -195,10 +195,12 @@ client.on(Events.MessageCreate, async (message: Message) => {
      * ------------------------------------------------------------ */
 
     let shouldAnswer = false;
+    let wasDirectlyMentioned = false;
 
     if (!message.guild) {
       // DMs: always respond
       shouldAnswer = true;
+      wasDirectlyMentioned = true;
     } else {
       const lower = rawText.toLowerCase();
       const bot = client.user!;
@@ -214,6 +216,7 @@ client.on(Events.MessageCreate, async (message: Message) => {
         lower.includes("merlina")
       ) {
         shouldAnswer = true;
+        wasDirectlyMentioned = true;
       }
 
       // 2. JARDIN lurking logic — spontaneous replies
@@ -222,9 +225,15 @@ client.on(Events.MessageCreate, async (message: Message) => {
         const timeSinceLastReply = Date.now() - lastReply;
         const isActive = timeSinceLastReply < ACTIVE_WINDOW_MS;
         const chance = isActive ? ACTIVE_REPLY_CHANCE : INACTIVE_REPLY_CHANCE;
-        console.log(`[LURK] isActive=${isActive} | timeSince=${Math.round(timeSinceLastReply/1000)}s | chance=${chance}`);
 
-        if (Math.random() < chance) {
+        // Cooldown: don’t lurk-respond more than once every 45 seconds
+        // This prevents replying to every message in a rapid burst
+        const LURK_COOLDOWN_MS = 45 * 1000;
+        const cooldownOk = timeSinceLastReply > LURK_COOLDOWN_MS || lastReply === 0;
+
+        console.log(`[LURK] isActive=${isActive} | timeSince=${Math.round(timeSinceLastReply/1000)}s | chance=${chance} | cooldownOk=${cooldownOk}`);
+
+        if (cooldownOk && Math.random() < chance) {
           shouldAnswer = true;
           console.log(`[LURK] ✅ Joining conversation (${isActive ? "Active" : "Inactive"} state)`);
         }
@@ -313,7 +322,13 @@ client.on(Events.MessageCreate, async (message: Message) => {
 
     const reply = await generateReply(messages);
 
-    await message.reply(stripEmojis(reply));
+    // Direct mentions → reply with quote (clear threading)
+    // Lurking responses → send to channel naturally (no quote, feels human)
+    if (wasDirectlyMentioned) {
+      await message.reply(stripEmojis(reply));
+    } else {
+      await (message.channel as any).send(stripEmojis(reply));
+    }
 
     // Update last reply timestamp for JARDIN active state tracking
     lastMerlinReply.set(message.channelId, Date.now());
