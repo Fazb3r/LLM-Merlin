@@ -12,3 +12,6 @@ primary_region = "ams"
   destination = "/usr/src/app/src/data"
 
 # No definimos puertos HTTP de entrada porque es un Bot de Discord (opera por Websocket)
+
+[deployment]
+  strategy = "recreate"
