@@ -128,6 +128,16 @@ const ACTIVE_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
 const ACTIVE_REPLY_CHANCE = 1.0;   // Always follow up if already in the conversation
 const INACTIVE_REPLY_CHANCE = 0.60; // 60% chance to join a new conversation unprompted
 
+// JARDIN channel: match by ID (most reliable) or by name as fallback
+// Set JARDIN_CHANNEL_ID in .env for reliable detection
+const JARDIN_CHANNEL_ID = process.env.JARDIN_CHANNEL_ID ?? "";
+function isJardinChannel(message: Message): boolean {
+  if (JARDIN_CHANNEL_ID && message.channelId === JARDIN_CHANNEL_ID) return true;
+  const name = (message.channel as any)?.name?.toLowerCase() ?? "";
+  console.log(`[LURK DEBUG] Channel name: "${name}" | Channel ID: ${message.channelId}`);
+  return name.includes("jardin") || name.includes("jard");
+}
+
 /* ============================================================
  *  FALLBACK GENERATOR
  * ============================================================ */
@@ -207,15 +217,16 @@ client.on(Events.MessageCreate, async (message: Message) => {
       }
 
       // 2. JARDIN lurking logic — spontaneous replies
-      if (!shouldAnswer && channelName.includes("jardin")) {
+      if (!shouldAnswer && isJardinChannel(message)) {
         const lastReply = lastMerlinReply.get(message.channelId) ?? 0;
         const timeSinceLastReply = Date.now() - lastReply;
         const isActive = timeSinceLastReply < ACTIVE_WINDOW_MS;
         const chance = isActive ? ACTIVE_REPLY_CHANCE : INACTIVE_REPLY_CHANCE;
+        console.log(`[LURK] isActive=${isActive} | timeSince=${Math.round(timeSinceLastReply/1000)}s | chance=${chance}`);
 
         if (Math.random() < chance) {
           shouldAnswer = true;
-          console.log(`[LURK] ${isActive ? "Active" : "Inactive"} state — joining conversation in #${channelName}`);
+          console.log(`[LURK] ✅ Joining conversation (${isActive ? "Active" : "Inactive"} state)`);
         }
       }
     }
