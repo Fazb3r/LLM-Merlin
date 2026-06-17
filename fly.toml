@@ -1,0 +1,14 @@
+# fly.toml para Merlin Bot
+
+app = "llm-merlin-bot"
+primary_region = "ams"
+
+[build]
+  dockerfile = "Dockerfile"
+
+# Configuración del disco persistente para guardar la base de datos sqlite (merlin.db)
+[mounts]
+  source = "data"
+  destination = "/usr/src/app/src/data"
+
+# No definimos puertos HTTP de entrada porque es un Bot de Discord (opera por Websocket)
