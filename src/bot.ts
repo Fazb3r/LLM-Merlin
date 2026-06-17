@@ -15,6 +15,7 @@ import Groq from "groq-sdk";
 
 // Core modules
 import { setupMessageLogger } from "./messageLoger";
+import { setupScheduler } from "./utils/scheduler";
 import { buildMemoryBlock } from "./memory/buildMemoryBlock";
 import { MERLIN_SYSTEM_PROMPT, MEMORY_USAGE_RULES } from "./system/system";
 
@@ -116,6 +117,18 @@ setInterval(() => {
 }, 30 * 60 * 1000);
 
 /* ============================================================
+ *  JARDIN ACTIVE CONVERSATION STATE
+ *  Tracks when Merlin last spoke in a channel.
+ *  If < 5 minutes ago → "Active" state (90% reply probability)
+ *  Otherwise → "Inactive" state (60% reply probability)
+ * ============================================================ */
+
+const lastMerlinReply = new Map<string, number>(); // channelId → timestamp
+const ACTIVE_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
+const ACTIVE_REPLY_CHANCE = 0.90;
+const INACTIVE_REPLY_CHANCE = 0.60;
+
+/* ============================================================
  *  FALLBACK GENERATOR
  * ============================================================ */
 
@@ -174,11 +187,14 @@ client.on(Events.MessageCreate, async (message: Message) => {
     let shouldAnswer = false;
 
     if (!message.guild) {
+      // DMs: always respond
       shouldAnswer = true;
     } else {
       const lower = rawText.toLowerCase();
       const bot = client.user!;
+      const channelName = (message.channel as any)?.name?.toLowerCase() ?? "";
 
+      // 1. Always respond if directly mentioned
       if (
         message.mentions.has(bot) ||
         lower.includes("merlin") ||
@@ -188,6 +204,19 @@ client.on(Events.MessageCreate, async (message: Message) => {
         lower.includes("merlina")
       ) {
         shouldAnswer = true;
+      }
+
+      // 2. JARDIN lurking logic — spontaneous replies
+      if (!shouldAnswer && channelName.includes("jardin")) {
+        const lastReply = lastMerlinReply.get(message.channelId) ?? 0;
+        const timeSinceLastReply = Date.now() - lastReply;
+        const isActive = timeSinceLastReply < ACTIVE_WINDOW_MS;
+        const chance = isActive ? ACTIVE_REPLY_CHANCE : INACTIVE_REPLY_CHANCE;
+
+        if (Math.random() < chance) {
+          shouldAnswer = true;
+          console.log(`[LURK] ${isActive ? "Active" : "Inactive"} state — joining conversation in #${channelName}`);
+        }
       }
     }
 
@@ -275,6 +304,9 @@ client.on(Events.MessageCreate, async (message: Message) => {
 
     await message.reply(stripEmojis(reply));
 
+    // Update last reply timestamp for JARDIN active state tracking
+    lastMerlinReply.set(message.channelId, Date.now());
+
   } catch (err) {
     console.error("[ERROR MESSAGE HANDLER]", err);
     try {
@@ -287,8 +319,9 @@ client.on(Events.MessageCreate, async (message: Message) => {
  *  STARTUP
  * ============================================================ */
 
-client.once(Events.ClientReady, () => {
+client.once(Events.ClientReady, (readyClient) => {
   console.log("Merlin is online 💛");
+  setupScheduler(readyClient);
 });
 
 setupMessageLogger(client);

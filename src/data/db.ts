@@ -48,6 +48,14 @@ CREATE TABLE IF NOT EXISTS server_lexicon (
   UNIQUE (guild_id, term)
 );
 
+CREATE TABLE IF NOT EXISTS server_lore (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  guild_id TEXT NOT NULL,
+  description TEXT NOT NULL,
+  created_by TEXT,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
 /* Ensure (user_id, key) is unique so we can UPSERT facts */
 CREATE UNIQUE INDEX IF NOT EXISTS idx_user_facts_user_key
 ON user_facts (user_id, key);
