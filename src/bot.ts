@@ -125,8 +125,8 @@ setInterval(() => {
 
 const lastMerlinReply = new Map<string, number>(); // channelId → timestamp
 const ACTIVE_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
-const ACTIVE_REPLY_CHANCE = 0.90;
-const INACTIVE_REPLY_CHANCE = 0.60;
+const ACTIVE_REPLY_CHANCE = 1.0;   // Always follow up if already in the conversation
+const INACTIVE_REPLY_CHANCE = 0.60; // 60% chance to join a new conversation unprompted
 
 /* ============================================================
  *  FALLBACK GENERATOR
