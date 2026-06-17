@@ -53,6 +53,42 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_user_facts_user_key
 ON user_facts (user_id, key);
 `);
 
+/* ---------- MIGRATIONS (SCHEMA UPDATES) ---------- */
+
+try {
+  const columns = db.pragma("table_info(user_facts)") as any[];
+  if (!columns.some((col) => col.name === "updated_at")) {
+    db.exec("ALTER TABLE user_facts ADD COLUMN updated_at DATETIME DEFAULT CURRENT_TIMESTAMP");
+    console.log("[DB] Migration: Added updated_at to user_facts");
+  }
+} catch (e) {
+  console.error("[DB] Failed to migrate user_facts:", e);
+}
+
+try {
+  const columns = db.pragma("table_info(user_profiles)") as any[];
+  if (!columns.some((col) => col.name === "updated_at")) {
+    db.exec("ALTER TABLE user_profiles ADD COLUMN updated_at DATETIME DEFAULT CURRENT_TIMESTAMP");
+    console.log("[DB] Migration: Added updated_at to user_profiles");
+  }
+} catch (e) {
+  console.error("[DB] Failed to migrate user_profiles:", e);
+}
+
+try {
+  const columns = db.pragma("table_info(server_lexicon)") as any[];
+  if (!columns.some((col) => col.name === "nsfw")) {
+    db.exec("ALTER TABLE server_lexicon ADD COLUMN nsfw INTEGER DEFAULT 0");
+    console.log("[DB] Migration: Added nsfw to server_lexicon");
+  }
+  if (!columns.some((col) => col.name === "updated_at")) {
+    db.exec("ALTER TABLE server_lexicon ADD COLUMN updated_at DATETIME DEFAULT CURRENT_TIMESTAMP");
+    console.log("[DB] Migration: Added updated_at to server_lexicon");
+  }
+} catch (e) {
+  console.error("[DB] Failed to migrate server_lexicon:", e);
+}
+
 /* ---------- TYPES ---------- */
 
 export interface MessageRow {
