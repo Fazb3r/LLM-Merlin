@@ -196,6 +196,7 @@ client.on(Events.MessageCreate, async (message: Message) => {
 
     let shouldAnswer = false;
     let wasDirectlyMentioned = false;
+    let isLurking = false;
 
     if (!message.guild) {
       // DMs: always respond
@@ -226,15 +227,15 @@ client.on(Events.MessageCreate, async (message: Message) => {
         const isActive = timeSinceLastReply < ACTIVE_WINDOW_MS;
         const chance = isActive ? ACTIVE_REPLY_CHANCE : INACTIVE_REPLY_CHANCE;
 
-        // Cooldown: don’t lurk-respond more than once every 45 seconds
-        // This prevents replying to every message in a rapid burst
-        const LURK_COOLDOWN_MS = 45 * 1000;
+        // Cooldown: don’t lurk-respond more than once every 20 seconds
+        const LURK_COOLDOWN_MS = 20 * 1000;
         const cooldownOk = timeSinceLastReply > LURK_COOLDOWN_MS || lastReply === 0;
 
         console.log(`[LURK] isActive=${isActive} | timeSince=${Math.round(timeSinceLastReply/1000)}s | chance=${chance} | cooldownOk=${cooldownOk}`);
 
         if (cooldownOk && Math.random() < chance) {
           shouldAnswer = true;
+          isLurking = true;
           console.log(`[LURK] ✅ Joining conversation (${isActive ? "Active" : "Inactive"} state)`);
         }
       }
@@ -308,6 +309,21 @@ client.on(Events.MessageCreate, async (message: Message) => {
           "Información obtenida de la web:\n\n" +
           webContext +
           "\nÚsala si es útil.",
+      });
+    }
+
+    // When lurking: inject a casual tone hint so Merlin reacts like a person, not a helper
+    if (isLurking) {
+      messages.push({
+        role: "system",
+        content:
+          "CONTEXT: You are joining this conversation spontaneously — nobody called you. " +
+          "React like a person who was reading the chat and felt like saying something. " +
+          "Be SHORT (1-2 sentences MAX). " +
+          "Do NOT ask a question unless it’s genuinely the only natural thing to say. " +
+          "Do NOT offer help. Do NOT act like an assistant. " +
+          "React, comment, tease, agree, or just drop a thought. " +
+          "Sound like you’re actually there in the conversation, not monitoring it.",
       });
     }
 
