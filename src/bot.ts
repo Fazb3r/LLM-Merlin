@@ -3,6 +3,7 @@ require("dotenv").config();
 
 import path from "path";
 import fs from "fs";
+import http from "http";
 import {
   Client,
   Collection,
@@ -291,5 +292,14 @@ client.once(Events.ClientReady, () => {
 });
 
 setupMessageLogger(client);
+
+// Servidor HTTP ligero para el health check de Fly.io (puerto 8080)
+const PORT = process.env.PORT || 8080;
+http.createServer((req, res) => {
+  res.writeHead(200, { "Content-Type": "text/plain" });
+  res.end("Merlin is alive! 💛");
+}).listen(PORT, () => {
+  console.log(`[HEALTH] Health check server listening on port ${PORT}`);
+});
 
 client.login(BOT_TOKEN);
