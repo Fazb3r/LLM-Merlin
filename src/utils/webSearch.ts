@@ -67,6 +67,8 @@ export function looksLikeCurrentEventQuestion(prompt: string): boolean {
         "tabla", "posiciones", "standings", "standing", "calendario", "fixture",
         "partidos de", "partido de", "clasificación", "clasificados", "resultados",
         "tabla de posiciones", "lck", "lpl", "lec", "lcs", "msi", "worlds",
+        "partido", "partidos", "marcador", "marcadores", "en vivo", "jugando",
+        "alineación", "alineaciones", "en directo",
         
         // Indicadores de tiempo presente/reciente - Español
         "hoy", "ahora", "actual", "actualmente", "este año", "este mes",
@@ -92,6 +94,16 @@ export function looksLikeCurrentEventQuestion(prompt: string): boolean {
     
     // Frases que casi siempre indican búsqueda de info actual
     const currentEventPhrases = [
+        "cómo va",
+        "como va",
+        "cómo van",
+        "como van",
+        "quién va",
+        "quien va",
+        "quién juega",
+        "quien juega",
+        "a qué hora",
+        "a que hora",
         "qué pasó",
         "que paso",
         "what happened",
