@@ -124,6 +124,7 @@ setInterval(() => {
  * ============================================================ */
 
 const lastMerlinReply = new Map<string, number>(); // channelId → timestamp
+const lastSearchQueries = new Map<string, string>(); // channelId → last search query
 const ACTIVE_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
 const ACTIVE_REPLY_CHANCE = 1.0;   // Always follow up if already in the conversation
 const INACTIVE_REPLY_CHANCE = 0.60; // 60% chance to join a new conversation unprompted
@@ -244,123 +245,168 @@ client.on(Events.MessageCreate, async (message: Message) => {
 
     if (!shouldAnswer) return;
 
-    /* ------------------------------------------------------------
-     * 2. Teaching detector (structured patterns)
-     * ------------------------------------------------------------ */
-
-    detectAndStoreTeaching(message);
-
-    /* ------------------------------------------------------------
-     * 3. Personal fact detection (LLM classifier)
-     * ------------------------------------------------------------ */
-
-    const detectedFact = await detectFactWithLLM(message);
-
-    if (detectedFact?.should_store && detectedFact.key && detectedFact.value) {
-      const targetId =
-        detectedFact.target === "self"
-          ? message.author.id
-          : detectedFact.target_user_id;
-
-      if (targetId) {
-        try {
-          insertUserFact.run(targetId, detectedFact.key, detectedFact.value);
-          console.log("[FACT SAVED]", detectedFact);
-        } catch (err) {
-          console.error("[FACT SAVE ERROR]", err);
-        }
-      }
-    }
-
-    /* ------------------------------------------------------------
-     * 4. Optional Web Search
-     * ------------------------------------------------------------ */
-
-    let webContext = "";
-
-    if (shouldSearchWeb(rawText)) {
-      const result = await searchWebWithTavily(rawText, "general");
-      if (result) webContext = result;
-    } else if (looksLikeCurrentEventQuestion(rawText)) {
-      const suggestion = getSuggestedSearchMessage(rawText);
-      await message.reply(stripEmojis(suggestion));
-      return;
-    }
-
-    /* ------------------------------------------------------------
-     * 5. MEMORY BLOCK
-     * ------------------------------------------------------------ */
-
-    const memoryBlock = await buildMemoryBlock(message);
-
-    /* ------------------------------------------------------------
-     * 6. Compose final messages
-     * ------------------------------------------------------------ */
-
-    const messages: any[] = [
-      { role: "system", content: MERLIN_SYSTEM_PROMPT },
-      { role: "system", content: MEMORY_USAGE_RULES },
-      { role: "system", content: memoryBlock },
-    ];
-
-    if (webContext) {
-      messages.push({
-        role: "system",
-        content:
-          "Información obtenida de la web:\n\n" +
-          webContext +
-          "\nÚsala si es útil.",
-      });
-    }
-
-    // When lurking: inject a casual tone hint so Merlin reacts like a person, not a helper
-    if (isLurking) {
-      messages.push({
-        role: "system",
-        content:
-          "CONTEXT: You are joining this conversation spontaneously — nobody called you. " +
-          "React like a person who was reading the chat and felt like saying something. " +
-          "Be SHORT (1-2 sentences MAX). " +
-          "Do NOT ask a question unless it’s genuinely the only natural thing to say. " +
-          "Do NOT offer help. Do NOT act like an assistant. " +
-          "React, comment, tease, agree, or just drop a thought. " +
-          "Sound like you’re actually there in the conversation, not monitoring it.",
-      });
-    }
-
-    messages.push({
-      role: "user",
-      content: rawText,
-    });
-
-    /* ------------------------------------------------------------
-     * 7. GENERATE RESPONSE
-     * ------------------------------------------------------------ */
-
-    // Show "is typing..." while the model generates
+    // Show "is typing..." immediately to indicate Merlin is active
     const ch = message.channel as any;
-    await ch.sendTyping();
+    await ch.sendTyping().catch(() => {});
     const typingInterval = setInterval(() => {
       ch.sendTyping().catch(() => {});
     }, 9000);
 
-    let reply: string;
     try {
-      reply = await generateReply(messages);
+      /* ------------------------------------------------------------
+       * 2. Teaching detector (structured patterns)
+       * ------------------------------------------------------------ */
+
+      detectAndStoreTeaching(message);
+
+      /* ------------------------------------------------------------
+       * 3. Personal fact detection (LLM classifier - Runs in background)
+       * ------------------------------------------------------------ */
+
+      detectFactWithLLM(message).then((detectedFact) => {
+        if (detectedFact?.should_store && detectedFact.key && detectedFact.value) {
+          const targetId =
+            detectedFact.target === "self"
+              ? message.author.id
+              : detectedFact.target_user_id;
+
+          if (targetId) {
+            try {
+              insertUserFact.run(targetId, detectedFact.key, detectedFact.value);
+              console.log("[FACT SAVED IN BACKGROUND]", detectedFact);
+            } catch (err) {
+              console.error("[FACT SAVE ERROR]", err);
+            }
+          }
+        }
+      }).catch((err) => {
+        console.error("[BACKGROUND FACT DETECTION ERROR]", err);
+      });
+
+      /* ------------------------------------------------------------
+       * 4. Optional Web Search
+       * ------------------------------------------------------------ */
+
+      let webContext = "";
+      const isCurrentEvent = looksLikeCurrentEventQuestion(rawText);
+      const isExplicitSearch = shouldSearchWeb(rawText);
+
+      // Conversational follow-up search logic:
+      // If we are active in the channel, the current message is a question, 
+      // and we have a previous search query, we merge them.
+      let queryToSearch = "";
+      if (isExplicitSearch) {
+        queryToSearch = rawText;
+      } else if (isCurrentEvent) {
+        queryToSearch = rawText;
+      } else {
+        const lastReply = lastMerlinReply.get(message.channelId) ?? 0;
+        const timeSinceLastReply = Date.now() - lastReply;
+        const isActive = timeSinceLastReply < ACTIVE_WINDOW_MS;
+        const previousQuery = lastSearchQueries.get(message.channelId);
+
+        const isQuestion = rawText.endsWith("?") ||
+          /^(qui[eé]n|c[oó]mo|qu[eé]|cu[aá]ndo|d[oó]nde|por\s*qu[eé]|cu[aá]l(es)?)\b/i.test(rawText);
+
+        if (isActive && previousQuery && isQuestion) {
+          queryToSearch = `${previousQuery} ${rawText}`;
+          console.log(`[SEARCH] Context inherited. Combined query: "${queryToSearch}"`);
+        }
+      }
+
+      if (queryToSearch) {
+        const result = await searchWebWithTavily(queryToSearch, "general");
+        if (result) {
+          webContext = result;
+          // Store query for follow-ups (strip command prefix if explicit search)
+          let storedQuery = queryToSearch;
+          if (isExplicitSearch) {
+            const spanishSearchCommands = ["busca", "búscame", "buscame", "investiga", "investigame", "investígame", "averigua", "averiguame", "averíguame", "consulta", "consultame", "consúltame"];
+            const englishSearchCommands = ["search", "search for", "look up", "lookup", "look this up", "find out", "check", "investigate"];
+            const lowerQuery = queryToSearch.toLowerCase().trim();
+            for (const cmd of [...spanishSearchCommands, ...englishSearchCommands]) {
+              if (lowerQuery.startsWith(cmd + " ")) {
+                storedQuery = queryToSearch.slice(cmd.length + 1).trim();
+                break;
+              } else if (lowerQuery.startsWith(cmd + ",")) {
+                storedQuery = queryToSearch.slice(cmd.length + 1).trim();
+                break;
+              }
+            }
+          }
+          lastSearchQueries.set(message.channelId, storedQuery);
+        } else if (isCurrentEvent) {
+          const suggestion = getSuggestedSearchMessage(rawText);
+          await message.reply(stripEmojis(suggestion));
+          return;
+        }
+      }
+
+      /* ------------------------------------------------------------
+       * 5. MEMORY BLOCK
+       * ------------------------------------------------------------ */
+
+      const memoryBlock = await buildMemoryBlock(message);
+
+      /* ------------------------------------------------------------
+       * 6. Compose final messages
+       * ------------------------------------------------------------ */
+
+      const messages: any[] = [
+        { role: "system", content: MERLIN_SYSTEM_PROMPT },
+        { role: "system", content: MEMORY_USAGE_RULES },
+        { role: "system", content: memoryBlock },
+      ];
+
+      if (webContext) {
+        messages.push({
+          role: "system",
+          content:
+            "Información obtenida de la web:\n\n" +
+            webContext +
+            "\nÚsala si es útil.",
+        });
+      }
+
+      if (isLurking) {
+        messages.push({
+          role: "system",
+          content:
+            "CONTEXT: You are joining this conversation spontaneously — nobody called you. " +
+            "React like a person who was reading the chat and felt like saying something. " +
+            "Be SHORT (1-2 sentences MAX). " +
+            "Do NOT ask a question unless it’s genuinely the only natural thing to say. " +
+            "Do NOT offer help. Do NOT act like an assistant. " +
+            "React, comment, tease, agree, or just drop a thought. " +
+            "Sound like you’re actually there in the conversation, not monitoring it.",
+        });
+      }
+
+      messages.push({
+        role: "user",
+        content: rawText,
+      });
+
+      /* ------------------------------------------------------------
+       * 7. GENERATE RESPONSE
+       * ------------------------------------------------------------ */
+
+      const reply = await generateReply(messages);
+
+      // Direct mentions → reply with quote (clear threading)
+      // Lurking responses → send to channel naturally (no quote, feels human)
+      if (wasDirectlyMentioned) {
+        await message.reply(stripEmojis(reply));
+      } else {
+        await (message.channel as any).send(stripEmojis(reply));
+      }
+
+      // Update last reply timestamp for JARDIN active state tracking
+      lastMerlinReply.set(message.channelId, Date.now());
+
     } finally {
       clearInterval(typingInterval);
     }
-
-    // Direct mentions → reply with quote (clear threading)
-    // Lurking responses → send to channel naturally (no quote, feels human)
-    if (wasDirectlyMentioned) {
-      await message.reply(stripEmojis(reply));
-    } else {
-      await (message.channel as any).send(stripEmojis(reply));
-    }
-
-    // Update last reply timestamp for JARDIN active state tracking
-    lastMerlinReply.set(message.channelId, Date.now());
 
   } catch (err) {
     console.error("[ERROR MESSAGE HANDLER]", err);
