@@ -227,9 +227,10 @@ client.on(Events.MessageCreate, async (message: Message) => {
         const isActive = timeSinceLastReply < ACTIVE_WINDOW_MS;
         const chance = isActive ? ACTIVE_REPLY_CHANCE : INACTIVE_REPLY_CHANCE;
 
-        // Cooldown: don’t lurk-respond more than once every 20 seconds
+        // Cooldown only applies when entering a cold conversation (inactive state)
+        // In active state Merlin is already in the conversation — no cooldown needed
         const LURK_COOLDOWN_MS = 20 * 1000;
-        const cooldownOk = timeSinceLastReply > LURK_COOLDOWN_MS || lastReply === 0;
+        const cooldownOk = isActive || timeSinceLastReply > LURK_COOLDOWN_MS || lastReply === 0;
 
         console.log(`[LURK] isActive=${isActive} | timeSince=${Math.round(timeSinceLastReply/1000)}s | chance=${chance} | cooldownOk=${cooldownOk}`);
 
