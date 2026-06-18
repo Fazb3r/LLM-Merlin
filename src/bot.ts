@@ -337,7 +337,19 @@ client.on(Events.MessageCreate, async (message: Message) => {
      * 7. GENERATE RESPONSE
      * ------------------------------------------------------------ */
 
-    const reply = await generateReply(messages);
+    // Show "is typing..." while the model generates
+    const ch = message.channel as any;
+    await ch.sendTyping();
+    const typingInterval = setInterval(() => {
+      ch.sendTyping().catch(() => {});
+    }, 9000);
+
+    let reply: string;
+    try {
+      reply = await generateReply(messages);
+    } finally {
+      clearInterval(typingInterval);
+    }
 
     // Direct mentions → reply with quote (clear threading)
     // Lurking responses → send to channel naturally (no quote, feels human)
