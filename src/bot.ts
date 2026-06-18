@@ -125,6 +125,16 @@ setInterval(() => {
 
 const lastMerlinReply = new Map<string, number>(); // channelId → timestamp
 const lastSearchQueries = new Map<string, string>(); // channelId → last search query
+const lastActiveUser = new Map<string, string>(); // channelId → userId (last user Merlin chatted with)
+
+interface QueueItem {
+  messages: Message[];
+  timer: NodeJS.Timeout;
+  wasDirectlyMentioned: boolean;
+  isLurking: boolean;
+}
+const channelQueues = new Map<string, QueueItem>();
+
 const ACTIVE_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
 const ACTIVE_REPLY_CHANCE = 1.0;   // Always follow up if already in the conversation
 const INACTIVE_REPLY_CHANCE = 0.60; // 60% chance to join a new conversation unprompted
@@ -176,6 +186,188 @@ async function generateReply(messages: any[], maxTokens = 700) {
 }
 
 /* ============================================================
+ *  DEBOUNCED QUEUE PROCESSOR
+ * ============================================================ */
+
+async function processQueue(channelId: string) {
+  const queue = channelQueues.get(channelId);
+  if (!queue) return;
+  channelQueues.delete(channelId);
+
+  const lastMessage = queue.messages[queue.messages.length - 1];
+  const wasDirectlyMentioned = queue.wasDirectlyMentioned;
+  const isLurking = queue.isLurking;
+
+  // Combine raw text from all queued messages
+  const combinedRawText = queue.messages
+    .map(m => m.content.replace(/<@!?\d+>/g, "").trim())
+    .filter(t => t.length > 0)
+    .join("\n");
+
+  if (combinedRawText.length === 0) return;
+
+  // Show "is typing..." immediately to indicate Merlin is active
+  const ch = lastMessage.channel as any;
+  await ch.sendTyping().catch(() => {});
+  const typingInterval = setInterval(() => {
+    ch.sendTyping().catch(() => {});
+  }, 9000);
+
+  try {
+    /* ------------------------------------------------------------
+     * 2. Teaching detector (structured patterns)
+     * ------------------------------------------------------------ */
+    detectAndStoreTeaching(lastMessage);
+
+    /* ------------------------------------------------------------
+     * 3. Personal fact detection (LLM classifier - Runs in background)
+     * ------------------------------------------------------------ */
+    detectFactWithLLM(lastMessage).then((detectedFact) => {
+      if (detectedFact?.should_store && detectedFact.key && detectedFact.value) {
+        const targetId =
+          detectedFact.target === "self"
+            ? lastMessage.author.id
+            : detectedFact.target_user_id;
+
+        if (targetId) {
+          try {
+            insertUserFact.run(targetId, detectedFact.key, detectedFact.value);
+            console.log("[FACT SAVED IN BACKGROUND]", detectedFact);
+          } catch (err) {
+            console.error("[FACT SAVE ERROR]", err);
+          }
+        }
+      }
+    }).catch((err) => {
+      console.error("[BACKGROUND FACT DETECTION ERROR]", err);
+    });
+
+    /* ------------------------------------------------------------
+     * 4. Optional Web Search
+     * ------------------------------------------------------------ */
+    let webContext = "";
+    const isCurrentEvent = looksLikeCurrentEventQuestion(combinedRawText);
+    const isExplicitSearch = shouldSearchWeb(combinedRawText);
+
+    let queryToSearch = "";
+    if (isExplicitSearch) {
+      queryToSearch = combinedRawText;
+    } else if (isCurrentEvent) {
+      queryToSearch = combinedRawText;
+    } else {
+      const lastReply = lastMerlinReply.get(channelId) ?? 0;
+      const timeSinceLastReply = Date.now() - lastReply;
+      const isActive = timeSinceLastReply < ACTIVE_WINDOW_MS;
+      const previousQuery = lastSearchQueries.get(channelId);
+
+      const isQuestion = combinedRawText.endsWith("?") ||
+        /^(qui[eé]n|c[oó]mo|qu[eé]|cu[aá]ndo|d[oó]nde|por\s*qu[eé]|cu[aá]l(es)?)\b/i.test(combinedRawText);
+
+      if (isActive && previousQuery && isQuestion) {
+        queryToSearch = `${previousQuery} ${combinedRawText}`;
+        console.log(`[SEARCH] Context inherited. Combined query: "${queryToSearch}"`);
+      }
+    }
+
+    if (queryToSearch) {
+      const result = await searchWebWithTavily(queryToSearch, "general");
+      if (result) {
+        webContext = result;
+        // Store query for follow-ups (strip command prefix if explicit search)
+        let storedQuery = queryToSearch;
+        if (isExplicitSearch) {
+          const spanishSearchCommands = ["busca", "buscar", "búscame", "buscame", "investiga", "investigar", "investigame", "investígame", "averigua", "averiguar", "averiguame", "averíguame", "consulta", "consultar", "consultame", "consúltame"];
+          const englishSearchCommands = ["search", "search for", "look up", "lookup", "look this up", "find out", "check", "investigate"];
+          const lowerQuery = queryToSearch.toLowerCase().trim();
+          for (const cmd of [...spanishSearchCommands, ...englishSearchCommands]) {
+            if (lowerQuery.startsWith(cmd + " ")) {
+              storedQuery = queryToSearch.slice(cmd.length + 1).trim();
+              break;
+            } else if (lowerQuery.startsWith(cmd + ",")) {
+              storedQuery = queryToSearch.slice(cmd.length + 1).trim();
+              break;
+            }
+          }
+        }
+        lastSearchQueries.set(channelId, storedQuery);
+      } else if (isCurrentEvent) {
+        const suggestion = getSuggestedSearchMessage(combinedRawText);
+        await lastMessage.reply(stripEmojis(suggestion));
+        return;
+      }
+    }
+
+    /* ------------------------------------------------------------
+     * 5. MEMORY BLOCK
+     * ------------------------------------------------------------ */
+    const memoryBlock = await buildMemoryBlock(lastMessage);
+
+    /* ------------------------------------------------------------
+     * 6. Compose final messages
+     * ------------------------------------------------------------ */
+    const messages: any[] = [
+      { role: "system", content: MERLIN_SYSTEM_PROMPT },
+      { role: "system", content: MEMORY_USAGE_RULES },
+      { role: "system", content: memoryBlock },
+    ];
+
+    if (webContext) {
+      messages.push({
+        role: "system",
+        content:
+          "Información obtenida de la web:\n\n" +
+          webContext +
+          "\nÚsala si es útil.",
+      });
+    }
+
+    if (isLurking) {
+      messages.push({
+        role: "system",
+        content:
+          "CONTEXT: You are joining this conversation spontaneously — nobody called you. " +
+          "React like a person who was reading the chat and felt like saying something. " +
+          "Be SHORT (1-2 sentences MAX). " +
+          "Do NOT ask a question unless it’s genuinely the only natural thing to say. " +
+          "Do NOT offer help. Do NOT act like an assistant. " +
+          "React, comment, tease, agree, or just drop a thought. " +
+          "Sound like you’re actually there in the conversation, not monitoring it.",
+      });
+    }
+
+    messages.push({
+      role: "user",
+      content: combinedRawText,
+    });
+
+    /* ------------------------------------------------------------
+     * 7. GENERATE RESPONSE
+     * ------------------------------------------------------------ */
+    const reply = await generateReply(messages);
+
+    // Direct mentions or replies to Merlin → reply with quote (clear threading)
+    // Lurking responses → send to channel naturally (no quote, feels human)
+    if (wasDirectlyMentioned) {
+      await lastMessage.reply(stripEmojis(reply));
+    } else {
+      await (lastMessage.channel as any).send(stripEmojis(reply));
+    }
+
+    // Update last reply timestamp and active user
+    lastMerlinReply.set(channelId, Date.now());
+    lastActiveUser.set(channelId, lastMessage.author.id);
+
+  } catch (err) {
+    console.error("[ERROR IN DEBOUNCED QUEUE PROCESSOR]", err);
+    try {
+      await lastMessage.reply("Algo falló 💛, intenta otra vez.");
+    } catch {}
+  } finally {
+    clearInterval(typingInterval);
+  }
+}
+
+/* ============================================================
  *  MAIN MESSAGE HANDLER
  * ============================================================ */
 
@@ -191,8 +383,53 @@ client.on(Events.MessageCreate, async (message: Message) => {
     const authorName =
       message.member?.displayName || message.author.username;
 
+    // 1. Check if there is an active queue for this channel
+    const activeQueue = channelQueues.get(message.channelId);
+    if (activeQueue) {
+      // Clear current timer to debounce
+      clearTimeout(activeQueue.timer);
+      activeQueue.messages.push(message);
+
+      // Recalculate if this message would trigger directly mentioned response
+      const bot = client.user!;
+      const lower = rawText.toLowerCase();
+
+      let isReplyToMerlin = false;
+      if (message.reference && message.reference.messageId) {
+        const cachedMsg = message.channel.messages.cache.get(message.reference.messageId);
+        if (cachedMsg) {
+          isReplyToMerlin = cachedMsg.author.id === client.user?.id;
+        } else {
+          try {
+            const refMsg = await message.channel.messages.fetch(message.reference.messageId);
+            isReplyToMerlin = refMsg.author.id === client.user?.id;
+          } catch {}
+        }
+      }
+
+      if (
+        message.mentions.has(bot) ||
+        isReplyToMerlin ||
+        lower.includes("merlin") ||
+        lower.startsWith("mer ") ||
+        lower.startsWith("mer,") ||
+        lower.startsWith("mer:") ||
+        lower.includes("merlina")
+      ) {
+        activeQueue.wasDirectlyMentioned = true;
+      }
+
+      // Reset the 3-second debounce timer
+      activeQueue.timer = setTimeout(() => {
+        processQueue(message.channelId);
+      }, 3000);
+
+      console.log(`[DEBOUNCE] Appended message to active queue for #${message.channelId}. Total in queue: ${activeQueue.messages.length}`);
+      return;
+    }
+
     /* ------------------------------------------------------------
-     * 1. Should Merlin respond?
+     * 2. Should Merlin respond? (No active queue case)
      * ------------------------------------------------------------ */
 
     let shouldAnswer = false;
@@ -236,7 +473,23 @@ client.on(Events.MessageCreate, async (message: Message) => {
         wasDirectlyMentioned = true;
       }
 
-      // 2. JARDIN lurking logic — spontaneous replies
+      // 2. Last active user continuation:
+      // If Merlin recently spoke in the channel (< 5 min) AND the message is from the user
+      // Merlin was last interacting with, we continue the conversation with 100% chance and no cooldown!
+      if (!shouldAnswer) {
+        const lastReply = lastMerlinReply.get(message.channelId) ?? 0;
+        const timeSinceLastReply = Date.now() - lastReply;
+        const isActive = timeSinceLastReply < ACTIVE_WINDOW_MS;
+        const lastUser = lastActiveUser.get(message.channelId);
+
+        if (isActive && lastUser === message.author.id) {
+          shouldAnswer = true;
+          wasDirectlyMentioned = true; // treat as direct continuation
+          console.log(`[CONVERSATION] Continuing active chat with user ${message.author.username}`);
+        }
+      }
+
+      // 3. JARDIN lurking logic — spontaneous replies
       if (!shouldAnswer && isJardinChannel(message)) {
         const lastReply = lastMerlinReply.get(message.channelId) ?? 0;
         const timeSinceLastReply = Date.now() - lastReply;
@@ -259,176 +512,24 @@ client.on(Events.MessageCreate, async (message: Message) => {
       }
     }
 
-    if (!shouldAnswer) return;
+    if (shouldAnswer) {
+      // Start the debounce queue
+      const timer = setTimeout(() => {
+        processQueue(message.channelId);
+      }, 3000);
 
-    // Show "is typing..." immediately to indicate Merlin is active
-    const ch = message.channel as any;
-    await ch.sendTyping().catch(() => {});
-    const typingInterval = setInterval(() => {
-      ch.sendTyping().catch(() => {});
-    }, 9000);
-
-    try {
-      /* ------------------------------------------------------------
-       * 2. Teaching detector (structured patterns)
-       * ------------------------------------------------------------ */
-
-      detectAndStoreTeaching(message);
-
-      /* ------------------------------------------------------------
-       * 3. Personal fact detection (LLM classifier - Runs in background)
-       * ------------------------------------------------------------ */
-
-      detectFactWithLLM(message).then((detectedFact) => {
-        if (detectedFact?.should_store && detectedFact.key && detectedFact.value) {
-          const targetId =
-            detectedFact.target === "self"
-              ? message.author.id
-              : detectedFact.target_user_id;
-
-          if (targetId) {
-            try {
-              insertUserFact.run(targetId, detectedFact.key, detectedFact.value);
-              console.log("[FACT SAVED IN BACKGROUND]", detectedFact);
-            } catch (err) {
-              console.error("[FACT SAVE ERROR]", err);
-            }
-          }
-        }
-      }).catch((err) => {
-        console.error("[BACKGROUND FACT DETECTION ERROR]", err);
+      channelQueues.set(message.channelId, {
+        messages: [message],
+        timer,
+        wasDirectlyMentioned,
+        isLurking
       });
 
-      /* ------------------------------------------------------------
-       * 4. Optional Web Search
-       * ------------------------------------------------------------ */
-
-      let webContext = "";
-      const isCurrentEvent = looksLikeCurrentEventQuestion(rawText);
-      const isExplicitSearch = shouldSearchWeb(rawText);
-
-      // Conversational follow-up search logic:
-      // If we are active in the channel, the current message is a question, 
-      // and we have a previous search query, we merge them.
-      let queryToSearch = "";
-      if (isExplicitSearch) {
-        queryToSearch = rawText;
-      } else if (isCurrentEvent) {
-        queryToSearch = rawText;
-      } else {
-        const lastReply = lastMerlinReply.get(message.channelId) ?? 0;
-        const timeSinceLastReply = Date.now() - lastReply;
-        const isActive = timeSinceLastReply < ACTIVE_WINDOW_MS;
-        const previousQuery = lastSearchQueries.get(message.channelId);
-
-        const isQuestion = rawText.endsWith("?") ||
-          /^(qui[eé]n|c[oó]mo|qu[eé]|cu[aá]ndo|d[oó]nde|por\s*qu[eé]|cu[aá]l(es)?)\b/i.test(rawText);
-
-        if (isActive && previousQuery && isQuestion) {
-          queryToSearch = `${previousQuery} ${rawText}`;
-          console.log(`[SEARCH] Context inherited. Combined query: "${queryToSearch}"`);
-        }
-      }
-
-      if (queryToSearch) {
-        const result = await searchWebWithTavily(queryToSearch, "general");
-        if (result) {
-          webContext = result;
-          // Store query for follow-ups (strip command prefix if explicit search)
-          let storedQuery = queryToSearch;
-          if (isExplicitSearch) {
-            const spanishSearchCommands = ["busca", "búscame", "buscame", "investiga", "investigame", "investígame", "averigua", "averiguame", "averíguame", "consulta", "consultame", "consúltame"];
-            const englishSearchCommands = ["search", "search for", "look up", "lookup", "look this up", "find out", "check", "investigate"];
-            const lowerQuery = queryToSearch.toLowerCase().trim();
-            for (const cmd of [...spanishSearchCommands, ...englishSearchCommands]) {
-              if (lowerQuery.startsWith(cmd + " ")) {
-                storedQuery = queryToSearch.slice(cmd.length + 1).trim();
-                break;
-              } else if (lowerQuery.startsWith(cmd + ",")) {
-                storedQuery = queryToSearch.slice(cmd.length + 1).trim();
-                break;
-              }
-            }
-          }
-          lastSearchQueries.set(message.channelId, storedQuery);
-        } else if (isCurrentEvent) {
-          const suggestion = getSuggestedSearchMessage(rawText);
-          await message.reply(stripEmojis(suggestion));
-          return;
-        }
-      }
-
-      /* ------------------------------------------------------------
-       * 5. MEMORY BLOCK
-       * ------------------------------------------------------------ */
-
-      const memoryBlock = await buildMemoryBlock(message);
-
-      /* ------------------------------------------------------------
-       * 6. Compose final messages
-       * ------------------------------------------------------------ */
-
-      const messages: any[] = [
-        { role: "system", content: MERLIN_SYSTEM_PROMPT },
-        { role: "system", content: MEMORY_USAGE_RULES },
-        { role: "system", content: memoryBlock },
-      ];
-
-      if (webContext) {
-        messages.push({
-          role: "system",
-          content:
-            "Información obtenida de la web:\n\n" +
-            webContext +
-            "\nÚsala si es útil.",
-        });
-      }
-
-      if (isLurking) {
-        messages.push({
-          role: "system",
-          content:
-            "CONTEXT: You are joining this conversation spontaneously — nobody called you. " +
-            "React like a person who was reading the chat and felt like saying something. " +
-            "Be SHORT (1-2 sentences MAX). " +
-            "Do NOT ask a question unless it’s genuinely the only natural thing to say. " +
-            "Do NOT offer help. Do NOT act like an assistant. " +
-            "React, comment, tease, agree, or just drop a thought. " +
-            "Sound like you’re actually there in the conversation, not monitoring it.",
-        });
-      }
-
-      messages.push({
-        role: "user",
-        content: rawText,
-      });
-
-      /* ------------------------------------------------------------
-       * 7. GENERATE RESPONSE
-       * ------------------------------------------------------------ */
-
-      const reply = await generateReply(messages);
-
-      // Direct mentions → reply with quote (clear threading)
-      // Lurking responses → send to channel naturally (no quote, feels human)
-      if (wasDirectlyMentioned) {
-        await message.reply(stripEmojis(reply));
-      } else {
-        await (message.channel as any).send(stripEmojis(reply));
-      }
-
-      // Update last reply timestamp for JARDIN active state tracking
-      lastMerlinReply.set(message.channelId, Date.now());
-
-    } finally {
-      clearInterval(typingInterval);
+      console.log(`[DEBOUNCE] Started new reply queue for #${message.channelId} (timeout 3s).`);
     }
 
   } catch (err) {
     console.error("[ERROR MESSAGE HANDLER]", err);
-    try {
-      await message.reply("Algo falló 💛, intenta otra vez.");
-    } catch {}
   }
 });
 
