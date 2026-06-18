@@ -9,15 +9,19 @@ export function shouldSearchWeb(prompt: string): boolean {
     // Comandos explícitos de búsqueda en español
     const spanishSearchCommands = [
         "busca",
+        "buscar",
         "búscame",
         "buscame",
         "investiga",
+        "investigar",
         "investigame",
         "investígame",
         "averigua",
+        "averiguar",
         "averiguame",
         "averíguame",
         "consulta",
+        "consultar",
         "consultame",
         "consúltame",
     ];
@@ -57,7 +61,12 @@ export function looksLikeCurrentEventQuestion(prompt: string): boolean {
     // Indicadores temporales que sugieren información reciente
     const temporalIndicators = [
         // Años recientes
-        "2024", "2025", "2026",
+        "2024", "2025", "2026", "2027", "2028",
+        
+        // Tablas y competiciones dinámicas (información en tiempo real)
+        "tabla", "posiciones", "standings", "standing", "calendario", "fixture",
+        "partidos de", "partido de", "clasificación", "clasificados", "resultados",
+        "tabla de posiciones", "lck", "lpl", "lec", "lcs", "msi", "worlds",
         
         // Indicadores de tiempo presente/reciente - Español
         "hoy", "ahora", "actual", "actualmente", "este año", "este mes",

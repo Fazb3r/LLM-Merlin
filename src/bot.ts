@@ -199,6 +199,20 @@ client.on(Events.MessageCreate, async (message: Message) => {
     let wasDirectlyMentioned = false;
     let isLurking = false;
 
+    // Check if the message is a direct reply to Merlin
+    let isReplyToMerlin = false;
+    if (message.reference && message.reference.messageId) {
+      const cachedMsg = message.channel.messages.cache.get(message.reference.messageId);
+      if (cachedMsg) {
+        isReplyToMerlin = cachedMsg.author.id === client.user?.id;
+      } else {
+        try {
+          const refMsg = await message.channel.messages.fetch(message.reference.messageId);
+          isReplyToMerlin = refMsg.author.id === client.user?.id;
+        } catch {}
+      }
+    }
+
     if (!message.guild) {
       // DMs: always respond
       shouldAnswer = true;
@@ -208,9 +222,10 @@ client.on(Events.MessageCreate, async (message: Message) => {
       const bot = client.user!;
       const channelName = (message.channel as any)?.name?.toLowerCase() ?? "";
 
-      // 1. Always respond if directly mentioned
+      // 1. Always respond if directly mentioned or if it's a direct reply to Merlin
       if (
         message.mentions.has(bot) ||
+        isReplyToMerlin ||
         lower.includes("merlin") ||
         lower.startsWith("mer ") ||
         lower.startsWith("mer,") ||
@@ -226,12 +241,13 @@ client.on(Events.MessageCreate, async (message: Message) => {
         const lastReply = lastMerlinReply.get(message.channelId) ?? 0;
         const timeSinceLastReply = Date.now() - lastReply;
         const isActive = timeSinceLastReply < ACTIVE_WINDOW_MS;
-        const chance = isActive ? ACTIVE_REPLY_CHANCE : INACTIVE_REPLY_CHANCE;
 
-        // Cooldown only applies when entering a cold conversation (inactive state)
-        // In active state Merlin is already in the conversation — no cooldown needed
+        // Cooldown of 20 seconds ALWAYS applies to lurking (spontaneous) replies to avoid spam
         const LURK_COOLDOWN_MS = 20 * 1000;
-        const cooldownOk = isActive || timeSinceLastReply > LURK_COOLDOWN_MS || lastReply === 0;
+        const cooldownOk = timeSinceLastReply > LURK_COOLDOWN_MS || lastReply === 0;
+
+        // Lurking chance: 30% if active (already conversing), 10% if inactive (cold conversation)
+        const chance = isActive ? 0.30 : 0.10;
 
         console.log(`[LURK] isActive=${isActive} | timeSince=${Math.round(timeSinceLastReply/1000)}s | chance=${chance} | cooldownOk=${cooldownOk}`);
 
