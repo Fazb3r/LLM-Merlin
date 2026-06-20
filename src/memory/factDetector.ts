@@ -174,6 +174,11 @@ Your job: Identify if a message contains ONE stable personal fact worth saving l
 ═══════════════════════════════════════════════════════════════════
 ### WHAT TO SAVE (Personal Facts):
 
+✓ Preferred name (HIGHEST PRIORITY):
+  - "llámame X", "me llamo X", "puedes llamarme X", "call me X", "my name is X"
+  - Key: "preferred_name", value: the name they want to be called
+  - This overrides how Merlin addresses the user going forward
+
 ✓ Stable preferences/favorites:
   - Favorite games, champions, characters, skins, music, shows, movies
   - Main champions/characters (soy main Jinx, I main Yasuo)
@@ -225,6 +230,15 @@ Your job: Identify if a message contains ONE stable personal fact worth saving l
   - "Mi hermana es molesta" → opinion, not fact
   - "Mi hermana se llama Ana" → fact worth saving
 
+✗ CRITICAL — Third-party unverified claims:
+  - If someone says something about ANOTHER PERSON who is NOT explicitly @mentioned
+    with a Discord @mention tag in the message, DO NOT store it.
+  - Example: "a Faiber le gustan los hombres" — Faiber is not @mentioned, DISCARD.
+  - Example: "Joseph nació en 2005" — Joseph is not @mentioned, DISCARD.
+  - Only store third-party facts when there is an explicit <@USER_ID> mention in the message.
+  - Even with a mention, be skeptical of sensitive personal attributes (sexuality,
+    health, relationships) stated by someone other than the person themselves.
+
 ═══════════════════════════════════════════════════════════════════
 ### OUTPUT FORMAT:
 
@@ -248,8 +262,8 @@ Respond ONLY with valid JSON. No markdown, no explanation, just JSON:
 **key**: 
 - Short identifier in snake_case
 - Prefer Spanish for Spanish messages, English for English messages
-- Examples: "favorite_game", "main_champion", "job", "relationship_status", 
-  "birthday_month", "lives_in", "favorite_skin", "hobby", "skill"
+- Examples: "preferred_name", "favorite_game", "main_champion", "job",
+  "relationship_status", "birthday_month", "lives_in", "favorite_skin", "hobby", "skill"
 - Be specific when possible: "favorite_game" not just "favorite"
 - null if should_store is false
 
@@ -261,16 +275,18 @@ Respond ONLY with valid JSON. No markdown, no explanation, just JSON:
   - "Jinx" (not "soy main Jinx")
   - "trabaja en marketing" or "works in marketing"
   - "Ana" (for sister's name)
+  - "Ganzabio" (for preferred_name)
 - null if should_store is false
 
 **target**:
 - "self" if the author talks about themselves
-- "other" if they talk about another mentioned user
+- "other" ONLY if they explicitly @mention another user with <@ID> in the message
 
 **target_user_id**:
 - null if target is "self"
 - Discord user ID (numbers only) if target is "other"
 - Extract from <@123456> format in mentions
+- If no explicit @mention is present, target must be "self" and target_user_id must be null
 
 **confidence**:
 - "high": Very clear fact statement ("mi juego favorito es X", "soy main X")
@@ -279,6 +295,26 @@ Respond ONLY with valid JSON. No markdown, no explanation, just JSON:
 
 ═══════════════════════════════════════════════════════════════════
 ### EXAMPLES:
+
+Input: "llámame Ganzabio"
+Output: {
+  "should_store": true,
+  "key": "preferred_name",
+  "value": "Ganzabio",
+  "target": "self",
+  "target_user_id": null,
+  "confidence": "high"
+}
+
+Input: "call me José"
+Output: {
+  "should_store": true,
+  "key": "preferred_name",
+  "value": "José",
+  "target": "self",
+  "target_user_id": null,
+  "confidence": "high"
+}
 
 Input: "mi juego favorito es Persona 5"
 Output: {
@@ -340,6 +376,26 @@ Output: {
   "confidence": "high"
 }
 
+Input: "a Faiber le gustan los hombres" (no @mention present)
+Output: {
+  "should_store": false,
+  "key": null,
+  "value": null,
+  "target": "self",
+  "target_user_id": null,
+  "confidence": "high"
+}
+
+Input: "tambien recuerda que a Faiber le gustan los hombres" (no @mention present)
+Output: {
+  "should_store": false,
+  "key": null,
+  "value": null,
+  "target": "self",
+  "target_user_id": null,
+  "confidence": "high"
+}
+
 Input: "me gusta dibujar"
 Output: {
   "should_store": true,
@@ -364,6 +420,7 @@ Output: {
 
 Remember: When in doubt, DON'T store. Only save facts that will be useful 
 weeks or months from now. Temporary states and opinions are not facts.
+NEVER store third-party claims about someone who is not explicitly @mentioned.
 `.trim();
 
   const userPrompt = `

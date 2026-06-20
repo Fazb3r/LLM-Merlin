@@ -69,6 +69,13 @@ export async function buildMemoryBlock(message: Message): Promise<string> {
   lines.push("[MEMORY BLOCK START]");
   lines.push("");
   lines.push(`User: ${username} (${userId})`);
+
+  // Surface preferred_name prominently — this overrides the Discord username
+  const preferredNameFact = facts.find(f => f.key === "preferred_name");
+  if (preferredNameFact) {
+    lines.push(`Preferred name: ${preferredNameFact.value} — ALWAYS use this name when addressing this user, NOT their Discord username ("${username}").`);
+  }
+
   lines.push("");
 
   // Profile

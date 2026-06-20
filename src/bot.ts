@@ -127,6 +127,9 @@ const lastMerlinReply = new Map<string, number>(); // channelId → timestamp
 const lastSearchQueries = new Map<string, string>(); // channelId → last search query
 const lastActiveUser = new Map<string, string>(); // channelId → userId (last user Merlin chatted with)
 
+// Faiber's Discord user ID — only Faiber himself can define facts about Faiber
+const FAIBER_ID = "456653774098792450";
+
 interface QueueItem {
   messages: Message[];
   timer: NodeJS.Timeout;
@@ -230,6 +233,13 @@ async function processQueue(channelId: string) {
             : detectedFact.target_user_id;
 
         if (targetId) {
+          // PROTECTION: Never let a non-Faiber user write facts about Faiber
+          const authorIsFaiber = lastMessage.author.id === FAIBER_ID;
+          if (targetId === FAIBER_ID && !authorIsFaiber) {
+            console.warn(`[FACT BLOCKED] User ${lastMessage.author.username} tried to store a fact about Faiber. Discarding.`);
+            return;
+          }
+
           try {
             insertUserFact.run(targetId, detectedFact.key, detectedFact.value);
             console.log("[FACT SAVED IN BACKGROUND]", detectedFact);
@@ -345,8 +355,9 @@ async function processQueue(channelId: string) {
      * ------------------------------------------------------------ */
     const reply = await generateReply(messages);
 
-    // Direct mentions or replies to Merlin → reply with quote (clear threading)
-    // Lurking responses → send to channel naturally (no quote, feels human)
+    // Only use Discord's .reply() (which tags/quotes the user) if they explicitly
+    // @mentioned Merlin or replied to Merlin's message. Conversation continuations
+    // and lurking responses go to the channel directly — no tag, no quote.
     if (wasDirectlyMentioned) {
       await lastMessage.reply(stripEmojis(reply));
     } else {
@@ -484,7 +495,7 @@ client.on(Events.MessageCreate, async (message: Message) => {
 
         if (isActive && lastUser === message.author.id) {
           shouldAnswer = true;
-          wasDirectlyMentioned = true; // treat as direct continuation
+          // wasDirectlyMentioned stays false — we send to channel, no reply/tag
           console.log(`[CONVERSATION] Continuing active chat with user ${message.author.username}`);
         }
       }
