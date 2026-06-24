@@ -12,6 +12,7 @@ import {
   Message,
 } from "discord.js";
 import Groq from "groq-sdk";
+import { GoogleGenerativeAI } from "@google/generative-ai";
 
 // Core modules
 import { setupMessageLogger } from "./messageLoger";
@@ -36,19 +37,28 @@ import { detectFactWithLLM } from "./memory/factDetector";
 
 /* ============================================================
  *  MODEL CONFIG
+ *  Priority chain:
+ *    1. Gemini 2.0 Flash (primary — generous free quota)
+ *    2. Groq gpt-oss-120b (secondary — fastest Groq model)
+ *    3. Groq llama-3.3-70b (tertiary — Groq fallback)
+ *  Each provider has its own independent rate-limit flag so
+ *  exhausting one doesn't silence the others.
  * ============================================================ */
 
 const BOT_TOKEN = process.env.DISCORD_LLM_BOT_TOKEN;
 
-// Main responder model
-const PRIMARY_MODEL = "openai/gpt-oss-120b";
+// Groq models (fallback chain)
+const GROQ_PRIMARY_MODEL   = "openai/gpt-oss-120b";
+const GROQ_SECONDARY_MODEL = "llama-3.3-70b-versatile";
 
-// Classifier / fallback
-const SECONDARY_MODEL = "llama-3.3-70b-versatile";
-
+// Groq client
 const groq = new Groq({
   apiKey: process.env.GROQ_API_KEY!,
 });
+
+// Gemini client (primary)
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY ?? "";
+const geminiClient = GEMINI_API_KEY ? new GoogleGenerativeAI(GEMINI_API_KEY) : null;
 
 /* ============================================================
  *  UTILS
@@ -135,6 +145,61 @@ const MIN_AUTO_RESPONSE_GAP_MS = 8 * 1000; // 8 seconds
 const BURST_COUNT_THRESHOLD = 4;
 const BURST_WINDOW_MS = 20 * 1000; // 20 seconds
 
+/* ============================================================
+ *  RATE LIMIT STATE  (per provider)
+ *  Each provider tracks its own cooldown independently.
+ *  Hitting Gemini's limit triggers Groq. Hitting all triggers
+ *  the one-notice-then-silent fallback.
+ * ============================================================ */
+
+// Sentinel return value — signals ALL providers are rate limited
+const RATE_LIMITED_SENTINEL = "__RATE_LIMITED__";
+
+// Cooldown after hitting a provider's daily limit — 1 hour
+const RATE_LIMIT_COOLDOWN_MS = 60 * 60 * 1000;
+
+// Per-provider rate limit timestamps (null = not rate limited)
+let geminiRateLimitedUntil: number | null = null;
+let groqRateLimitedUntil:   number | null = null;
+
+// Tracks which channels have already received the "out of tokens" notice
+const rateLimitNoticeSent = new Set<string>();
+
+function checkProviderLimit(until: number | null, name: string): { limited: boolean; newUntil: number | null } {
+  if (until === null) return { limited: false, newUntil: null };
+  if (Date.now() >= until) {
+    console.log(`[RATE LIMIT] ${name} cooldown expired — back online.`);
+    return { limited: false, newUntil: null };
+  }
+  return { limited: true, newUntil: until };
+}
+
+function isGeminiRateLimited(): boolean {
+  const { limited, newUntil } = checkProviderLimit(geminiRateLimitedUntil, "Gemini");
+  geminiRateLimitedUntil = newUntil;
+  return limited;
+}
+
+function isGroqRateLimited(): boolean {
+  const { limited, newUntil } = checkProviderLimit(groqRateLimitedUntil, "Groq");
+  groqRateLimitedUntil = newUntil;
+  return limited;
+}
+
+function allProvidersRateLimited(): boolean {
+  return isGeminiRateLimited() && isGroqRateLimited();
+}
+
+function isRateLimitError(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false;
+  const e = err as any;
+  if (e.status === 429) return true;
+  if (e.error?.code === "rate_limit_exceeded") return true;
+  if (e.code === "rate_limit_exceeded") return true;
+  const msg = String(e.message ?? "");
+  return msg.includes("rate_limit") || msg.includes("rate limit") || msg.includes("429") || msg.includes("RESOURCE_EXHAUSTED") || msg.includes("quota");
+}
+
 // Faiber's Discord user ID — only Faiber himself can define facts about Faiber
 const FAIBER_ID = "456653774098792450";
 
@@ -161,39 +226,118 @@ function isJardinChannel(message: Message): boolean {
 }
 
 /* ============================================================
- *  FALLBACK GENERATOR
+ *  GEMINI MESSAGE BUILDER
+ *  Converts OpenAI-style [{role, content}] messages to the
+ *  format Gemini expects: system instruction + user message.
+ *  All system messages are merged into systemInstruction.
+ *  Conversation history and the final user turn are combined
+ *  into the last message sent to the chat.
  * ============================================================ */
 
-async function generateReply(messages: any[], maxTokens = 700) {
-  try {
-    const completion = await groq.chat.completions.create({
-      model: PRIMARY_MODEL,
-      messages,
-      max_tokens: maxTokens,
-      temperature: 0.7,
-    });
+function buildGeminiRequest(messages: any[]): { systemInstruction: string; userMessage: string } {
+  const systemParts: string[] = [];
+  const historyParts: string[] = [];
+  let lastUserMessage = "";
 
-    console.log(`[MODEL] Using ${PRIMARY_MODEL}`);
-    return completion.choices[0]?.message?.content ?? "";
-  } catch (e) {
-    console.error("[PRIMARY MODEL FAILED]", e);
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i];
+    if (msg.role === "system") {
+      systemParts.push(msg.content as string);
+    } else if (i === messages.length - 1) {
+      lastUserMessage = msg.content as string;
+    } else {
+      // Conversation history turns
+      historyParts.push(msg.content as string);
+    }
   }
 
-  // fallback
-  try {
-    const backup = await groq.chat.completions.create({
-      model: SECONDARY_MODEL,
-      messages,
-      max_tokens: Math.min(maxTokens, 500),
-      temperature: 0.7,
-    });
+  const systemInstruction = systemParts.join("\n\n---\n\n");
+  const userMessage = historyParts.length > 0
+    ? `--- Recent conversation ---\n${historyParts.join("\n")}\n\n${lastUserMessage}`
+    : lastUserMessage;
 
-    console.log(`[MODEL] Fallback to ${SECONDARY_MODEL}`);
-    return backup.choices[0]?.message?.content ?? "";
-  } catch (e2) {
-    console.error("[SECONDARY MODEL FAILED]", e2);
-    return "Algo se bugueó fuerte 💛";
+  return { systemInstruction, userMessage };
+}
+
+/* ============================================================
+ *  3-TIER MODEL CASCADE
+ *  1. Gemini 2.0 Flash   (primary)
+ *  2. Groq gpt-oss-120b  (secondary)
+ *  3. Groq llama-3.3-70b (tertiary)
+ * ============================================================ */
+
+async function generateReply(messages: any[], maxTokens = 700): Promise<string> {
+
+  // ── TIER 1: Gemini 2.0 Flash ───────────────────────────────
+  if (geminiClient && !isGeminiRateLimited()) {
+    try {
+      const { systemInstruction, userMessage } = buildGeminiRequest(messages);
+      const model = geminiClient.getGenerativeModel({
+        model: "gemini-2.0-flash",
+        systemInstruction,
+        generationConfig: { maxOutputTokens: maxTokens, temperature: 0.7 },
+      });
+      const result = await model.generateContent(userMessage);
+      const text = result.response.text();
+      console.log("[MODEL] Gemini 2.0 Flash ✓");
+      return text;
+    } catch (e) {
+      if (isRateLimitError(e)) {
+        geminiRateLimitedUntil = Date.now() + RATE_LIMIT_COOLDOWN_MS;
+        console.warn(`[RATE LIMIT] Gemini quota hit — falling back to Groq. Retry after ${new Date(geminiRateLimitedUntil).toISOString()}`);
+      } else {
+        console.error("[GEMINI FAILED]", e);
+      }
+    }
+  } else if (!geminiClient) {
+    console.warn("[MODEL] No GEMINI_API_KEY set — skipping Gemini tier.");
   }
+
+  // ── TIER 2: Groq gpt-oss-120b ──────────────────────────────
+  if (!isGroqRateLimited()) {
+    try {
+      const completion = await groq.chat.completions.create({
+        model: GROQ_PRIMARY_MODEL,
+        messages,
+        max_tokens: maxTokens,
+        temperature: 0.7,
+      });
+      console.log(`[MODEL] Groq ${GROQ_PRIMARY_MODEL} ✓`);
+      return completion.choices[0]?.message?.content ?? "";
+    } catch (e) {
+      if (isRateLimitError(e)) {
+        // Don't set groq rate limit yet — try secondary first
+        console.warn("[RATE LIMIT] Groq primary quota hit — trying secondary.");
+      } else {
+        console.error(`[GROQ PRIMARY FAILED]`, e);
+      }
+    }
+  }
+
+  // ── TIER 3: Groq llama-3.3-70b ─────────────────────────────
+  if (!isGroqRateLimited()) {
+    try {
+      const backup = await groq.chat.completions.create({
+        model: GROQ_SECONDARY_MODEL,
+        messages,
+        max_tokens: Math.min(maxTokens, 500),
+        temperature: 0.7,
+      });
+      console.log(`[MODEL] Groq ${GROQ_SECONDARY_MODEL} ✓`);
+      return backup.choices[0]?.message?.content ?? "";
+    } catch (e2) {
+      if (isRateLimitError(e2)) {
+        groqRateLimitedUntil = Date.now() + RATE_LIMIT_COOLDOWN_MS;
+        console.warn(`[RATE LIMIT] Groq quota hit. Retry after ${new Date(groqRateLimitedUntil).toISOString()}`);
+      } else {
+        console.error(`[GROQ SECONDARY FAILED]`, e2);
+        return "Algo se bugueó fuerte 💛"; // Non-rate-limit error — return generic
+      }
+    }
+  }
+
+  // All providers exhausted or rate limited
+  return RATE_LIMITED_SENTINEL;
 }
 
 /* ============================================================
@@ -392,6 +536,33 @@ async function processQueue(channelId: string) {
      * ------------------------------------------------------------ */
     const reply = await generateReply(messages);
 
+    // ── RATE LIMIT HANDLING ───────────────────────────────────────
+    // generateReply returns sentinel when ALL providers are exhausted.
+    // Send ONE in-character notice per channel, then stay silent.
+    if (reply === RATE_LIMITED_SENTINEL) {
+      if (!rateLimitNoticeSent.has(channelId)) {
+        rateLimitNoticeSent.add(channelId);
+        // Estimate how long until earliest provider resets
+        const earliest = Math.min(
+          geminiRateLimitedUntil ?? Date.now() + 3600000,
+          groqRateLimitedUntil   ?? Date.now() + 3600000,
+        );
+        const minutesLeft = Math.max(1, Math.ceil((earliest - Date.now()) / 60000));
+        const notices = [
+          `me quedé sin tokens por hoy. vuelvo en ${minutesLeft} minutos 💛`,
+          `límite de tokens alcanzado. silencio temporal, vuelvo pronto.`,
+          `se acabaron los tokens por hoy. hasta luego 💛`,
+        ];
+        const notice = notices[Math.floor(Math.random() * notices.length)];
+        await (lastMessage.channel as any).send(notice);
+        console.log(`[RATE LIMIT] Sent notice to channel ${channelId}`);
+      } else {
+        // Already sent notice — stay silent
+        console.log(`[RATE LIMIT] Still rate limited. Staying silent in channel ${channelId}.`);
+      }
+      return; // Do NOT update lastMerlinReply — don't count this as an active response
+    }
+
     // Only use Discord's .reply() (which tags/quotes the user) if they explicitly
     // @mentioned Merlin or replied to Merlin's message. Conversation continuations
     // and lurking responses go to the channel directly — no tag, no quote.
@@ -409,9 +580,19 @@ async function processQueue(channelId: string) {
 
   } catch (err) {
     console.error("[ERROR IN DEBOUNCED QUEUE PROCESSOR]", err);
-    try {
-      await lastMessage.reply("Algo falló 💛, intenta otra vez.");
-    } catch {}
+    if (isRateLimitError(err)) {
+      // Mark both providers as rate limited as a safety measure
+      if (!geminiRateLimitedUntil) geminiRateLimitedUntil = Date.now() + RATE_LIMIT_COOLDOWN_MS;
+      if (!groqRateLimitedUntil)   groqRateLimitedUntil   = Date.now() + RATE_LIMIT_COOLDOWN_MS;
+      if (!rateLimitNoticeSent.has(channelId)) {
+        rateLimitNoticeSent.add(channelId);
+        await (lastMessage.channel as any).send("me quedé sin tokens. vuelvo después 💛").catch(() => {});
+      }
+    } else {
+      try {
+        await lastMessage.reply("Algo falló 💛, intenta otra vez.");
+      } catch {}
+    }
   } finally {
     clearInterval(typingInterval);
   }

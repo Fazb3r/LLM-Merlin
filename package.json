@@ -6,13 +6,15 @@
     "test": "echo \"Error: no test specified\" && exit 1",
     "build": "tsc",
     "start": "node dist/bot.js",
-    "deploy:commands": "node dist/deploy/deployCommands.js"
+    "deploy:commands": "node dist/deploy/deployCommands.js",
+    "cleanup": "node dist/data/cleanup.js"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "description": "",
   "dependencies": {
+    "@google/generative-ai": "^0.24.1",
     "better-sqlite3": "^12.5.0",
     "discord.js": "^14.17.2",
     "dotenv": "^16.4.7",

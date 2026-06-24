@@ -1,0 +1,11 @@
+node_modules
+dist
+.env
+merlin.db
+src/data/merlin.db
+.git
+.gitignore
+Dockerfile
+.dockerignore
+.agents
+.gemini
