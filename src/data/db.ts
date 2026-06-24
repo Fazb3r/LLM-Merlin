@@ -93,6 +93,10 @@ try {
     db.exec("ALTER TABLE server_lexicon ADD COLUMN updated_at DATETIME DEFAULT CURRENT_TIMESTAMP");
     console.log("[DB] Migration: Added updated_at to server_lexicon");
   }
+  if (!columns.some((col) => col.name === "taught_by_username")) {
+    db.exec("ALTER TABLE server_lexicon ADD COLUMN taught_by_username TEXT");
+    console.log("[DB] Migration: Added taught_by_username to server_lexicon");
+  }
 } catch (e) {
   console.error("[DB] Failed to migrate server_lexicon:", e);
 }
@@ -130,6 +134,7 @@ export interface ServerLexiconRow {
   term: string;
   definition: string;
   taught_by: string | null;
+  taught_by_username: string | null;
   source_msg_id: string | null;
   nsfw: number;
   created_at: string;
@@ -168,12 +173,13 @@ export const upsertUserProfile = db.prepare(`
 `);
 
 export const upsertServerDefinition = db.prepare(`
-  INSERT INTO server_lexicon (guild_id, term, definition, taught_by, source_msg_id, nsfw)
-  VALUES (@guild_id, @term, @definition, @taught_by, @source_msg_id, @nsfw)
+  INSERT INTO server_lexicon (guild_id, term, definition, taught_by, taught_by_username, source_msg_id, nsfw)
+  VALUES (@guild_id, @term, @definition, @taught_by, @taught_by_username, @source_msg_id, @nsfw)
   ON CONFLICT(guild_id, term)
   DO UPDATE SET
     definition = excluded.definition,
     taught_by = excluded.taught_by,
+    taught_by_username = excluded.taught_by_username,
     source_msg_id = excluded.source_msg_id,
     nsfw = excluded.nsfw,
     updated_at = CURRENT_TIMESTAMP

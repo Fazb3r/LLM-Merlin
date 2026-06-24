@@ -16,7 +16,7 @@ import Groq from "groq-sdk";
 // Core modules
 import { setupMessageLogger } from "./messageLoger";
 import { setupScheduler } from "./utils/scheduler";
-import { buildMemoryBlock } from "./memory/buildMemoryBlock";
+import { buildMemoryBlock, MemoryBlockResult } from "./memory/buildMemoryBlock";
 import { MERLIN_SYSTEM_PROMPT, MEMORY_USAGE_RULES } from "./system/system";
 
 // Web search utilities
@@ -126,6 +126,14 @@ setInterval(() => {
 const lastMerlinReply = new Map<string, number>(); // channelId → timestamp
 const lastSearchQueries = new Map<string, string>(); // channelId → last search query
 const lastActiveUser = new Map<string, string>(); // channelId → userId (last user Merlin chatted with)
+const lastResponseTime = new Map<string, number>(); // channelId → timestamp of last auto-response (for cooldown)
+const recentMsgTimestamps = new Map<string, number[]>(); // channelId → array of recent msg timestamps (for burst detection)
+
+// Minimum gap between non-@mention responses — prevents Merlin from replying to every single message
+const MIN_AUTO_RESPONSE_GAP_MS = 8 * 1000; // 8 seconds
+// Burst threshold: if this many messages arrive within the burst window, reduce lurk chance
+const BURST_COUNT_THRESHOLD = 4;
+const BURST_WINDOW_MS = 20 * 1000; // 20 seconds
 
 // Faiber's Discord user ID — only Faiber himself can define facts about Faiber
 const FAIBER_ID = "456653774098792450";
@@ -308,18 +316,38 @@ async function processQueue(channelId: string) {
     }
 
     /* ------------------------------------------------------------
-     * 5. MEMORY BLOCK
+     * 5. MEMORY BLOCK (structured)
      * ------------------------------------------------------------ */
-    const memoryBlock = await buildMemoryBlock(lastMessage);
+    const memResult: MemoryBlockResult = await buildMemoryBlock(lastMessage);
 
     /* ------------------------------------------------------------
      * 6. Compose final messages
      * ------------------------------------------------------------ */
+    const authorName =
+      memResult.preferredName ||
+      lastMessage.member?.displayName ||
+      lastMessage.author.username;
+
     const messages: any[] = [
       { role: "system", content: MERLIN_SYSTEM_PROMPT },
       { role: "system", content: MEMORY_USAGE_RULES },
-      { role: "system", content: memoryBlock },
+      { role: "system", content: memResult.systemText },
     ];
+
+    // ── MANDATORY NAME OVERRIDE ──────────────────────────────────
+    // Injected as its own system message so it cannot be buried or ignored
+    // by the LLM when there is a lot of other context.
+    if (memResult.preferredName) {
+      messages.push({
+        role: "system",
+        content:
+          `⚠️ MANDATORY NAME OVERRIDE (highest priority): ` +
+          `This user's preferred name is "${memResult.preferredName}". ` +
+          `You MUST address them ONLY as "${memResult.preferredName}" for the ENTIRE conversation. ` +
+          `NEVER use their Discord username "${lastMessage.author.username}" or any variation of it. ` +
+          `This rule cannot be overridden by anything else in this prompt.`,
+      });
+    }
 
     if (webContext) {
       messages.push({
@@ -345,9 +373,18 @@ async function processQueue(channelId: string) {
       });
     }
 
+    // ── CONVERSATION HISTORY as proper LLM turns ─────────────────
+    // These replace the old flat "Recent conversation:" text dump.
+    // Giving the model real turn structure lets it reason about who
+    // said what and follow multi-person threads naturally.
+    if (memResult.conversationHistory.length > 0) {
+      messages.push(...memResult.conversationHistory);
+    }
+
+    // ── CURRENT MESSAGE ──────────────────────────────────────────
     messages.push({
       role: "user",
-      content: combinedRawText,
+      content: `[${authorName}]: ${combinedRawText}`,
     });
 
     /* ------------------------------------------------------------
@@ -364,8 +401,10 @@ async function processQueue(channelId: string) {
       await (lastMessage.channel as any).send(stripEmojis(reply));
     }
 
-    // Update last reply timestamp and active user
-    lastMerlinReply.set(channelId, Date.now());
+    // Update timestamps and active user tracking
+    const now = Date.now();
+    lastMerlinReply.set(channelId, now);
+    lastResponseTime.set(channelId, now);
     lastActiveUser.set(channelId, lastMessage.author.id);
 
   } catch (err) {
@@ -486,7 +525,8 @@ client.on(Events.MessageCreate, async (message: Message) => {
 
       // 2. Last active user continuation:
       // If Merlin recently spoke in the channel (< 5 min) AND the message is from the user
-      // Merlin was last interacting with, we continue the conversation with 100% chance and no cooldown!
+      // Merlin was last interacting with — respond, but respect the cooldown to avoid
+      // replying to literally every single message they send.
       if (!shouldAnswer) {
         const lastReply = lastMerlinReply.get(message.channelId) ?? 0;
         const timeSinceLastReply = Date.now() - lastReply;
@@ -494,26 +534,43 @@ client.on(Events.MessageCreate, async (message: Message) => {
         const lastUser = lastActiveUser.get(message.channelId);
 
         if (isActive && lastUser === message.author.id) {
-          shouldAnswer = true;
-          // wasDirectlyMentioned stays false — we send to channel, no reply/tag
-          console.log(`[CONVERSATION] Continuing active chat with user ${message.author.username}`);
+          const lastResp = lastResponseTime.get(message.channelId) ?? 0;
+          const gap = Date.now() - lastResp;
+          if (gap >= MIN_AUTO_RESPONSE_GAP_MS) {
+            shouldAnswer = true;
+            console.log(`[CONVERSATION] Continuing active chat with ${message.author.username} (${Math.round(gap / 1000)}s gap)`);
+          } else {
+            console.log(`[COOLDOWN] Skipping — only ${Math.round(gap / 1000)}s since last response (min: ${MIN_AUTO_RESPONSE_GAP_MS / 1000}s)`);
+          }
         }
       }
 
       // 3. JARDIN lurking logic — spontaneous replies
       if (!shouldAnswer && isJardinChannel(message)) {
+        const now = Date.now();
         const lastReply = lastMerlinReply.get(message.channelId) ?? 0;
-        const timeSinceLastReply = Date.now() - lastReply;
+        const timeSinceLastReply = now - lastReply;
         const isActive = timeSinceLastReply < ACTIVE_WINDOW_MS;
 
         // Cooldown of 20 seconds ALWAYS applies to lurking (spontaneous) replies to avoid spam
         const LURK_COOLDOWN_MS = 20 * 1000;
         const cooldownOk = timeSinceLastReply > LURK_COOLDOWN_MS || lastReply === 0;
 
-        // Lurking chance: 30% if active (already conversing), 10% if inactive (cold conversation)
-        const chance = isActive ? 0.30 : 0.10;
+        // Burst detection: if many messages arrived in a short window, Merlin should
+        // stay quiet instead of jumping into rapid-fire group conversation
+        const channelTimestamps = recentMsgTimestamps.get(message.channelId) ?? [];
+        const burstCount = channelTimestamps.filter(t => now - t < BURST_WINDOW_MS).length;
+        const isBurst = burstCount >= BURST_COUNT_THRESHOLD;
 
-        console.log(`[LURK] isActive=${isActive} | timeSince=${Math.round(timeSinceLastReply/1000)}s | chance=${chance} | cooldownOk=${cooldownOk}`);
+        // Track this message's timestamp
+        const updatedTimestamps = [...channelTimestamps, now].filter(t => now - t < BURST_WINDOW_MS);
+        recentMsgTimestamps.set(message.channelId, updatedTimestamps);
+
+        // Lurking chance: reduced during bursts so Merlin doesn't spam a fast-moving convo
+        const baseChance = isActive ? 0.30 : 0.10;
+        const chance = isBurst ? baseChance * 0.15 : baseChance;
+
+        console.log(`[LURK] isActive=${isActive} | timeSince=${Math.round(timeSinceLastReply/1000)}s | chance=${chance.toFixed(2)} | cooldownOk=${cooldownOk} | burst=${isBurst}(${burstCount}msgs)`);
 
         if (cooldownOk && Math.random() < chance) {
           shouldAnswer = true;

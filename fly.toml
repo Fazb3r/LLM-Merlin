@@ -1,6 +1,6 @@
 # fly.toml para Merlin Bot
 
-app = "llm-merlin-bot"
+app = "llm-merlin"
 primary_region = "ams"
 
 [build]
