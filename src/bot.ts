@@ -155,20 +155,25 @@ const BURST_WINDOW_MS = 20 * 1000; // 20 seconds
 // Sentinel return value — signals ALL providers are rate limited
 const RATE_LIMITED_SENTINEL = "__RATE_LIMITED__";
 
-// Cooldown after hitting a provider's daily limit — 1 hour
-const RATE_LIMIT_COOLDOWN_MS = 60 * 60 * 1000;
+// Groq: 15-minute cooldown (per-minute limits recover quickly; daily limits reset at midnight UTC)
+const GROQ_COOLDOWN_MS   = 15 * 60 * 1000;
+// Gemini: 6-hour cooldown (daily free-tier quota is large but resets once a day)
+const GEMINI_COOLDOWN_MS = 6 * 60 * 60 * 1000;
 
 // Per-provider rate limit timestamps (null = not rate limited)
 let geminiRateLimitedUntil: number | null = null;
 let groqRateLimitedUntil:   number | null = null;
 
 // Tracks which channels have already received the "out of tokens" notice
+// Cleared automatically when all providers come back online
 const rateLimitNoticeSent = new Set<string>();
 
 function checkProviderLimit(until: number | null, name: string): { limited: boolean; newUntil: number | null } {
   if (until === null) return { limited: false, newUntil: null };
   if (Date.now() >= until) {
     console.log(`[RATE LIMIT] ${name} cooldown expired — back online.`);
+    // Also clear all channel notices so Merlin can respond again normally
+    rateLimitNoticeSent.clear();
     return { limited: false, newUntil: null };
   }
   return { limited: true, newUntil: until };
@@ -290,7 +295,7 @@ async function generateReply(messages: any[], maxTokens = 700): Promise<string> 
         return text;
       } catch (e: any) {
         if (isRateLimitError(e)) {
-          geminiRateLimitedUntil = Date.now() + RATE_LIMIT_COOLDOWN_MS;
+          geminiRateLimitedUntil = Date.now() + GEMINI_COOLDOWN_MS;
           console.warn(`[RATE LIMIT] Gemini quota hit — falling back to Groq. Retry after ${new Date(geminiRateLimitedUntil).toISOString()}`);
           break; // No point trying the other Gemini model if we're rate limited
         }
@@ -343,8 +348,8 @@ async function generateReply(messages: any[], maxTokens = 700): Promise<string> 
       return backup.choices[0]?.message?.content ?? "";
     } catch (e2) {
       if (isRateLimitError(e2)) {
-        groqRateLimitedUntil = Date.now() + RATE_LIMIT_COOLDOWN_MS;
-        console.warn(`[RATE LIMIT] Groq quota hit. Retry after ${new Date(groqRateLimitedUntil).toISOString()}`);
+        groqRateLimitedUntil = Date.now() + GROQ_COOLDOWN_MS;
+        console.warn(`[RATE LIMIT] Groq quota hit. Retry after ${new Date(groqRateLimitedUntil).toISOString()} (15-min cooldown)`);
       } else {
         console.error(`[GROQ SECONDARY FAILED]`, e2);
         return "Algo se bugueó fuerte 💛"; // Non-rate-limit error — return generic
@@ -598,8 +603,8 @@ async function processQueue(channelId: string) {
     console.error("[ERROR IN DEBOUNCED QUEUE PROCESSOR]", err);
     if (isRateLimitError(err)) {
       // Mark both providers as rate limited as a safety measure
-      if (!geminiRateLimitedUntil) geminiRateLimitedUntil = Date.now() + RATE_LIMIT_COOLDOWN_MS;
-      if (!groqRateLimitedUntil)   groqRateLimitedUntil   = Date.now() + RATE_LIMIT_COOLDOWN_MS;
+      if (!geminiRateLimitedUntil) geminiRateLimitedUntil = Date.now() + GEMINI_COOLDOWN_MS;
+      if (!groqRateLimitedUntil)   groqRateLimitedUntil   = Date.now() + GROQ_COOLDOWN_MS;
       if (!rateLimitNoticeSent.has(channelId)) {
         rateLimitNoticeSent.add(channelId);
         await (lastMessage.channel as any).send("me quedé sin tokens. vuelvo después 💛").catch(() => {});
