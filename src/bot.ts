@@ -48,8 +48,10 @@ import { detectFactWithLLM } from "./memory/factDetector";
 const BOT_TOKEN = process.env.DISCORD_LLM_BOT_TOKEN;
 
 // Groq models (fallback chain)
-const GROQ_PRIMARY_MODEL   = "openai/gpt-oss-120b";
-const GROQ_SECONDARY_MODEL = "llama-3.3-70b-versatile";
+// llama-3.3-70b: 30 RPM, 100K TPD — generous free tier, main Groq model
+// llama-4-scout: Meta's Llama 4, good quality backup
+const GROQ_PRIMARY_MODEL   = "llama-3.3-70b-versatile";
+const GROQ_SECONDARY_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct";
 
 // Groq client
 const groq = new Groq({
@@ -155,10 +157,26 @@ const BURST_WINDOW_MS = 20 * 1000; // 20 seconds
 // Sentinel return value — signals ALL providers are rate limited
 const RATE_LIMITED_SENTINEL = "__RATE_LIMITED__";
 
-// Groq: 15-minute cooldown (per-minute limits recover quickly; daily limits reset at midnight UTC)
-const GROQ_COOLDOWN_MS   = 15 * 60 * 1000;
-// Gemini: 6-hour cooldown (daily free-tier quota is large but resets once a day)
-const GEMINI_COOLDOWN_MS = 6 * 60 * 60 * 1000;
+// Cooldown after a rate-limit error.
+// The main limits we hit are per-minute (retry in ~60s), so 2 minutes is enough.
+// Daily limits are handled by the rateLimitNoticeSent channel silence mechanism.
+const GROQ_COOLDOWN_MS   = 2 * 60 * 1000;  // 2 minutes
+const GEMINI_COOLDOWN_MS = 2 * 60 * 1000;  // 2 minutes
+
+// Helper: extract retryAfter (in ms) from a rate-limit error, if the API provides it
+function getRetryAfterMs(err: any, defaultMs: number): number {
+  try {
+    // Google Gemini embeds retryDelay like "57s" in the error JSON
+    const raw = String(err?.message ?? "");
+    const m = raw.match(/"retryDelay"\s*:\s*"(\d+)s"/);
+    if (m) return (parseInt(m[1]) + 5) * 1000; // add 5s buffer
+    // Groq sends retry-after as seconds in response headers
+    const retryAfter = err?.headers?.["retry-after"] ?? err?.response?.headers?.["retry-after"];
+    if (retryAfter) return (parseInt(retryAfter) + 5) * 1000;
+  } catch {}
+  return defaultMs;
+}
+
 
 // Per-provider rate limit timestamps (null = not rate limited)
 let geminiRateLimitedUntil: number | null = null;
@@ -172,8 +190,6 @@ function checkProviderLimit(until: number | null, name: string): { limited: bool
   if (until === null) return { limited: false, newUntil: null };
   if (Date.now() >= until) {
     console.log(`[RATE LIMIT] ${name} cooldown expired — back online.`);
-    // Also clear all channel notices so Merlin can respond again normally
-    rateLimitNoticeSent.clear();
     return { limited: false, newUntil: null };
   }
   return { limited: true, newUntil: until };
@@ -295,8 +311,9 @@ async function generateReply(messages: any[], maxTokens = 700): Promise<string> 
         return text;
       } catch (e: any) {
         if (isRateLimitError(e)) {
-          geminiRateLimitedUntil = Date.now() + GEMINI_COOLDOWN_MS;
-          console.warn(`[RATE LIMIT] Gemini quota hit — falling back to Groq. Retry after ${new Date(geminiRateLimitedUntil).toISOString()}`);
+          const waitMs = getRetryAfterMs(e, GEMINI_COOLDOWN_MS);
+          geminiRateLimitedUntil = Date.now() + waitMs;
+          console.warn(`[RATE LIMIT] Gemini rate limited — Groq is now primary for ${Math.ceil(waitMs / 1000)}s. Resume: ${new Date(geminiRateLimitedUntil).toISOString()}`);
           break; // No point trying the other Gemini model if we're rate limited
         }
         console.error(`[GEMINI FAILED] Model: ${geminiModel} | Status: ${e?.status ?? "?"} | Message: ${e?.message ?? String(e)}`);
@@ -311,7 +328,7 @@ async function generateReply(messages: any[], maxTokens = 700): Promise<string> 
     console.warn("[MODEL] No GEMINI_API_KEY — Gemini tier skipped.");
   } else {
     const resumeAt = new Date(geminiRateLimitedUntil!).toISOString();
-    console.log(`[MODEL] Gemini rate limited until ${resumeAt} — using Groq.`);
+    console.log(`[MODEL] Gemini rate limited until ${resumeAt} — Groq is primary.`);
   }
 
   // ── TIER 2: Groq gpt-oss-120b ──────────────────────────────
@@ -346,10 +363,11 @@ async function generateReply(messages: any[], maxTokens = 700): Promise<string> 
       });
       console.log(`[MODEL] Groq ${GROQ_SECONDARY_MODEL} ✓`);
       return backup.choices[0]?.message?.content ?? "";
-    } catch (e2) {
+    } catch (e2: any) {
       if (isRateLimitError(e2)) {
-        groqRateLimitedUntil = Date.now() + GROQ_COOLDOWN_MS;
-        console.warn(`[RATE LIMIT] Groq quota hit. Retry after ${new Date(groqRateLimitedUntil).toISOString()} (15-min cooldown)`);
+        const waitMs = getRetryAfterMs(e2, GROQ_COOLDOWN_MS);
+        groqRateLimitedUntil = Date.now() + waitMs;
+        console.warn(`[RATE LIMIT] Groq quota hit. Retry after ${new Date(groqRateLimitedUntil).toISOString()} (${Math.ceil(waitMs / 1000)}s cooldown)`);
       } else {
         console.error(`[GROQ SECONDARY FAILED]`, e2);
         return "Algo se bugueó fuerte 💛"; // Non-rate-limit error — return generic
@@ -598,6 +616,9 @@ async function processQueue(channelId: string) {
     lastMerlinReply.set(channelId, now);
     lastResponseTime.set(channelId, now);
     lastActiveUser.set(channelId, lastMessage.author.id);
+    // Successful reply — clear the rate-limit notice flag for this channel
+    // so the next exhaustion cycle can still send ONE new notice
+    rateLimitNoticeSent.delete(channelId);
 
   } catch (err) {
     console.error("[ERROR IN DEBOUNCED QUEUE PROCESSOR]", err);
