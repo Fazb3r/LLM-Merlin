@@ -270,27 +270,43 @@ async function generateReply(messages: any[], maxTokens = 700): Promise<string> 
 
   // ── TIER 1: Gemini 2.0 Flash ───────────────────────────────
   if (geminiClient && !isGeminiRateLimited()) {
-    try {
-      const { systemInstruction, userMessage } = buildGeminiRequest(messages);
-      const model = geminiClient.getGenerativeModel({
-        model: "gemini-2.0-flash",
-        systemInstruction,
-        generationConfig: { maxOutputTokens: maxTokens, temperature: 0.7 },
-      });
-      const result = await model.generateContent(userMessage);
-      const text = result.response.text();
-      console.log("[MODEL] Gemini 2.0 Flash ✓");
-      return text;
-    } catch (e) {
-      if (isRateLimitError(e)) {
-        geminiRateLimitedUntil = Date.now() + RATE_LIMIT_COOLDOWN_MS;
-        console.warn(`[RATE LIMIT] Gemini quota hit — falling back to Groq. Retry after ${new Date(geminiRateLimitedUntil).toISOString()}`);
-      } else {
-        console.error("[GEMINI FAILED]", e);
+    // Try gemini-2.0-flash first, fall back to gemini-1.5-flash if unavailable
+    const geminiModels = ["gemini-2.0-flash", "gemini-1.5-flash"];
+    let geminiSucceeded = false;
+
+    for (const geminiModel of geminiModels) {
+      try {
+        console.log(`[MODEL] Attempting ${geminiModel}...`);
+        const { systemInstruction, userMessage } = buildGeminiRequest(messages);
+        const model = geminiClient.getGenerativeModel({
+          model: geminiModel,
+          systemInstruction,
+          generationConfig: { maxOutputTokens: maxTokens, temperature: 0.7 },
+        });
+        const result = await model.generateContent(userMessage);
+        const text = result.response.text();
+        console.log(`[MODEL] ${geminiModel} ✓`);
+        geminiSucceeded = true;
+        return text;
+      } catch (e: any) {
+        if (isRateLimitError(e)) {
+          geminiRateLimitedUntil = Date.now() + RATE_LIMIT_COOLDOWN_MS;
+          console.warn(`[RATE LIMIT] Gemini quota hit — falling back to Groq. Retry after ${new Date(geminiRateLimitedUntil).toISOString()}`);
+          break; // No point trying the other Gemini model if we're rate limited
+        }
+        console.error(`[GEMINI FAILED] Model: ${geminiModel} | Status: ${e?.status ?? "?"} | Message: ${e?.message ?? String(e)}`);
+        // Try next Gemini model
       }
     }
+
+    if (!geminiSucceeded) {
+      console.warn("[MODEL] All Gemini models failed — falling through to Groq.");
+    }
   } else if (!geminiClient) {
-    console.warn("[MODEL] No GEMINI_API_KEY set — skipping Gemini tier.");
+    console.warn("[MODEL] No GEMINI_API_KEY — Gemini tier skipped.");
+  } else {
+    const resumeAt = new Date(geminiRateLimitedUntil!).toISOString();
+    console.log(`[MODEL] Gemini rate limited until ${resumeAt} — using Groq.`);
   }
 
   // ── TIER 2: Groq gpt-oss-120b ──────────────────────────────
@@ -787,7 +803,11 @@ client.on(Events.MessageCreate, async (message: Message) => {
  * ============================================================ */
 
 client.once(Events.ClientReady, (readyClient) => {
+  // Log which AI providers are available at startup
   console.log("Merlin is online 💛");
+  console.log(`[STARTUP] Gemini: ${geminiClient ? "✅ client initialized" : "❌ NO KEY (GEMINI_API_KEY not set)"}`);
+  console.log(`[STARTUP] Groq primary: ${GROQ_PRIMARY_MODEL}`);
+  console.log(`[STARTUP] Groq secondary: ${GROQ_SECONDARY_MODEL}`);
   setupScheduler(readyClient);
 });
 
