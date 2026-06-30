@@ -315,7 +315,7 @@ async function generateReply(messages: any[], maxTokens = 700): Promise<string> 
         const model = geminiClient.getGenerativeModel({
           model: geminiModel,
           systemInstruction,
-          generationConfig: { maxOutputTokens: maxTokens, temperature: 0.7 },
+          generationConfig: { maxOutputTokens: maxTokens, temperature: 0.85 },
         });
         const result = await model.generateContent(userMessage);
         const text = result.response.text();
@@ -353,7 +353,7 @@ async function generateReply(messages: any[], maxTokens = 700): Promise<string> 
         model: GROQ_PRIMARY_MODEL,
         messages,
         max_tokens: maxTokens,
-        temperature: 0.7,
+        temperature: 0.85,
       });
       console.log(`[MODEL] Groq ${GROQ_PRIMARY_MODEL} ✓`);
       return completion.choices[0]?.message?.content ?? "";
@@ -374,7 +374,7 @@ async function generateReply(messages: any[], maxTokens = 700): Promise<string> 
         model: GROQ_SECONDARY_MODEL,
         messages,
         max_tokens: Math.min(maxTokens, 500),
-        temperature: 0.7,
+        temperature: 0.85,
       });
       console.log(`[MODEL] Groq ${GROQ_SECONDARY_MODEL} ✓`);
       return backup.choices[0]?.message?.content ?? "";
