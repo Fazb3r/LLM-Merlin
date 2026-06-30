@@ -182,6 +182,18 @@ function getRetryAfterMs(err: any, defaultMs: number): number {
 let geminiRateLimitedUntil: number | null = null;
 let groqRateLimitedUntil:   number | null = null;
 
+// Consecutive Gemini 429 failures — used for exponential backoff.
+// If Gemini has limit:0 (no free quota), it will fail every retry.
+// After 3 failures, we back off aggressively so we stop wasting 2s per message.
+let geminiConsecutiveFailures = 0;
+const GEMINI_MAX_BACKOFF_MS = 2 * 60 * 60 * 1000; // 2 hours max
+
+function geminiBackoffMs(baseMs: number): number {
+  // Double the cooldown per consecutive failure, capped at 2 hours
+  const backoff = baseMs * Math.pow(2, Math.max(0, geminiConsecutiveFailures - 2));
+  return Math.min(backoff, GEMINI_MAX_BACKOFF_MS);
+}
+
 // Tracks which channels have already received the "out of tokens" notice
 // Cleared automatically when all providers come back online
 const rateLimitNoticeSent = new Set<string>();
@@ -211,6 +223,7 @@ function allProvidersRateLimited(): boolean {
   return isGeminiRateLimited() && isGroqRateLimited();
 }
 
+
 function isRateLimitError(err: unknown): boolean {
   if (!err || typeof err !== "object") return false;
   const e = err as any;
@@ -232,8 +245,8 @@ interface QueueItem {
 }
 const channelQueues = new Map<string, QueueItem>();
 
-const ACTIVE_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
-const ACTIVE_REPLY_CHANCE = 1.0;   // Always follow up if already in the conversation
+const ACTIVE_WINDOW_MS = 3 * 60 * 1000; // 3 minutes (was 5)
+const ACTIVE_CONTINUATION_CHANCE = 0.40; // 40% chance to follow up with same user (was 100%)
 const INACTIVE_REPLY_CHANCE = 0.60; // 60% chance to join a new conversation unprompted
 
 // JARDIN channel: match by ID (most reliable) or by name as fallback
@@ -308,12 +321,14 @@ async function generateReply(messages: any[], maxTokens = 700): Promise<string> 
         const text = result.response.text();
         console.log(`[MODEL] ${geminiModel} ✓`);
         geminiSucceeded = true;
+        geminiConsecutiveFailures = 0; // reset on success
         return text;
       } catch (e: any) {
         if (isRateLimitError(e)) {
-          const waitMs = getRetryAfterMs(e, GEMINI_COOLDOWN_MS);
+          geminiConsecutiveFailures++;
+          const waitMs = geminiBackoffMs(getRetryAfterMs(e, GEMINI_COOLDOWN_MS));
           geminiRateLimitedUntil = Date.now() + waitMs;
-          console.warn(`[RATE LIMIT] Gemini rate limited — Groq is now primary for ${Math.ceil(waitMs / 1000)}s. Resume: ${new Date(geminiRateLimitedUntil).toISOString()}`);
+          console.warn(`[RATE LIMIT] Gemini rate limited (failure #${geminiConsecutiveFailures}) — Groq is primary for ${Math.ceil(waitMs / 1000)}s. Resume: ${new Date(geminiRateLimitedUntil).toISOString()}`);
           break; // No point trying the other Gemini model if we're rate limited
         }
         console.error(`[GEMINI FAILED] Model: ${geminiModel} | Status: ${e?.status ?? "?"} | Message: ${e?.message ?? String(e)}`);
@@ -602,14 +617,50 @@ async function processQueue(channelId: string) {
       return; // Do NOT update lastMerlinReply — don't count this as an active response
     }
 
+    // Strip conversation-format leaks AND banned opener/closer phrases that the model
+    // ignores in spite of system-prompt instructions.
+    function sanitizeReply(text: string): string {
+      let s = text
+        .replace(/^\[[\w\s\d&.,'!?-]+\]\s*:?\s*/u, "")  // strip leading [Name]: prefix
+        .replace(/^Parece que[,\s]/i, "")
+        .replace(/^Entiendo que[,\s]/i, "")
+        .replace(/^Veo que[,\s]/i, "")
+        .replace(/^Entonces[,\s]/i, "")
+        .replace(/^Ah, parece[,\s]/i, "")
+        .trim();
+
+      // Strip trailing question sentence when the reply already has prior content.
+      // Merlin's prompt bans closing questions; this enforces it in code.
+      // Only strip if there is at least one sentence before the question, so a
+      // single-sentence genuine answer/question is never deleted.
+      const parts = s.split(/(?<=[.!])\s+(?=[A-ZÁÉÍÓÚÑ¿"])/u);
+      if (parts.length > 1 && parts[parts.length - 1].trim().endsWith("?")) {
+        const stripped = parts[parts.length - 1].trim();
+        s = parts.slice(0, -1).join(" ").trim();
+        console.log(`[SANITIZE] Stripped trailing question: "${stripped}"`);
+      }
+
+      return s;
+    }
+
+
+    const safeReply = sanitizeReply(stripEmojis(reply));
+
+    // If after sanitizing the reply is empty, skip it silently
+    if (!safeReply) {
+      console.warn("[REPLY SANITIZED] Reply was empty after stripping format leak — skipping.");
+      return;
+    }
+
     // Only use Discord's .reply() (which tags/quotes the user) if they explicitly
     // @mentioned Merlin or replied to Merlin's message. Conversation continuations
     // and lurking responses go to the channel directly — no tag, no quote.
     if (wasDirectlyMentioned) {
-      await lastMessage.reply(stripEmojis(reply));
+      await lastMessage.reply(safeReply);
     } else {
-      await (lastMessage.channel as any).send(stripEmojis(reply));
+      await (lastMessage.channel as any).send(safeReply);
     }
+
 
     // Update timestamps and active user tracking
     const now = Date.now();
@@ -759,11 +810,13 @@ client.on(Events.MessageCreate, async (message: Message) => {
         if (isActive && lastUser === message.author.id) {
           const lastResp = lastResponseTime.get(message.channelId) ?? 0;
           const gap = Date.now() - lastResp;
-          if (gap >= MIN_AUTO_RESPONSE_GAP_MS) {
+          // Skip if message is a short reaction or image-only (Merlin can't see attachments)
+          const isReaction = rawText.length < 20 && (message.attachments.size > 0 || message.embeds.length > 0 || rawText.length < 8);
+          if (!isReaction && gap >= MIN_AUTO_RESPONSE_GAP_MS && Math.random() < ACTIVE_CONTINUATION_CHANCE) {
             shouldAnswer = true;
-            console.log(`[CONVERSATION] Continuing active chat with ${message.author.username} (${Math.round(gap / 1000)}s gap)`);
+            console.log(`[CONVERSATION] Continuing active chat with ${message.author.username} (${Math.round(gap / 1000)}s gap, 40% roll passed)`);
           } else {
-            console.log(`[COOLDOWN] Skipping — only ${Math.round(gap / 1000)}s since last response (min: ${MIN_AUTO_RESPONSE_GAP_MS / 1000}s)`);
+            console.log(`[COOLDOWN] Skipping — ${isReaction ? "image/reaction message" : `${Math.round(gap / 1000)}s gap or 40% roll failed`}`);
           }
         }
       }
@@ -793,9 +846,15 @@ client.on(Events.MessageCreate, async (message: Message) => {
         const baseChance = isActive ? 0.30 : 0.10;
         const chance = isBurst ? baseChance * 0.15 : baseChance;
 
-        console.log(`[LURK] isActive=${isActive} | timeSince=${Math.round(timeSinceLastReply/1000)}s | chance=${chance.toFixed(2)} | cooldownOk=${cooldownOk} | burst=${isBurst}(${burstCount}msgs)`);
+        // Skip responding when the message is an image/GIF/short-reaction:
+        // Merlin can't see attachments and responding with generic observations
+        // makes her look incoherent.
+        const isReactionMsg = rawText.length < 15 || (message.attachments.size > 0 && rawText.length < 30);
+        const adjustedChance = isReactionMsg ? chance * 0.05 : chance; // near-zero for image-only
 
-        if (cooldownOk && Math.random() < chance) {
+        console.log(`[LURK] isActive=${isActive} | timeSince=${Math.round(timeSinceLastReply/1000)}s | chance=${adjustedChance.toFixed(2)} | cooldownOk=${cooldownOk} | burst=${isBurst}(${burstCount}msgs) | reaction=${isReactionMsg}`);
+
+        if (cooldownOk && Math.random() < adjustedChance) {
           shouldAnswer = true;
           isLurking = true;
           console.log(`[LURK] ✅ Joining conversation (${isActive ? "Active" : "Inactive"} state)`);
