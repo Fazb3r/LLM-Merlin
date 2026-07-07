@@ -2,6 +2,7 @@
 import { Client, TextChannel } from "discord.js";
 import Groq from "groq-sdk";
 import { searchWebWithTavily } from "./webSearch";
+import { runServerStyleLearning } from "./serverStyleLearner";
 
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY! });
 
@@ -169,4 +170,25 @@ export function setupScheduler(client: Client): void {
   // --- Hourly conversation starter ---
   setInterval(() => runHourlyStarter(client), 60 * 60 * 1000);
   console.log("[SCHEDULER] Hourly conversation starter active (30% chance/hour).");
+
+  // --- Server style learning (every 6 hours + immediate) ---
+  async function runStyleLearningForAllGuilds() {
+    console.log("[SCHEDULER] Running server style learning for all guilds...");
+    for (const guild of client.guilds.cache.values()) {
+      try {
+        await runServerStyleLearning(guild.id, groq);
+      } catch (err) {
+        console.error(`[SCHEDULER] Failed to run style learning for guild ${guild.id}:`, err);
+      }
+    }
+  }
+
+  // Run 10 seconds after startup to avoid blocking initial launch logs
+  setTimeout(() => {
+    runStyleLearningForAllGuilds();
+  }, 10 * 1000);
+
+  // Repeat every 6 hours
+  setInterval(runStyleLearningForAllGuilds, 6 * 60 * 60 * 1000);
+  console.log("[SCHEDULER] Server style learning active (every 6 hours).");
 }

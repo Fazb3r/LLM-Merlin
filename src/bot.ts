@@ -652,6 +652,40 @@ async function processQueue(channelId: string) {
       return;
     }
 
+    // ── NARRATOR FILTER ───────────────────────────────────────────────────────
+    // The model keeps producing "reporter-style" observations about the conversation
+    // despite system-prompt bans. This detects them at code level and skips the
+    // response when Merlin is lurking (not directly addressed).
+    // When directly mentioned, we still send — can't go fully silent on someone.
+    function isNarratorResponse(text: string): boolean {
+      const patterns = [
+        // "el/un ambiente X aquí/del chat"
+        /\b(el|un) ambiente\b.{0,40}\b(aquí|del chat|del servidor)\b/i,
+        // "la conversación se ha/está volviendo X"
+        /\bla conversaci[oó]n\b.{0,40}\b(se (ha|está)|volvi[eé])\b/i,
+        // "el chat se ha/está X"
+        /\bel chat\b.{0,40}\b(se (ha|está))\b/i,
+        // "hay un X aquí/en el chat"
+        /\bhay un\b.{0,40}\b(aquí|en el (chat|servidor|canal))\b/i,
+        // "hemos/han encontrado un consenso"
+        /\b(hemos|han) encontrado\b.{0,30}\bconsenso\b/i,
+        // "todos quieren/están hablando" (omniscient observer)
+        /\btodos (quieren|est[aá]n)\b.{0,30}\b(hablar|hablando)\b/i,
+        // "hay un tema común/interesante aquí"
+        /\bhay un tema\b.{0,40}\b(aquí|com[uú]n|interesante)\b/i,
+        // "la energía está X"
+        /\bla energ[ií]a\b.{0,20}\best[aá]\b/i,
+        // "el tema de X está/ha"
+        /\bel tema\b.{0,30}\b(est[aá]|se ha)\b/i,
+      ];
+      return patterns.some(p => p.test(text));
+    }
+
+    if (!wasDirectlyMentioned && isNarratorResponse(safeReply)) {
+      console.warn(`[NARRATOR FILTER] Skipping lurk response — narrator pattern detected: "${safeReply.slice(0, 80)}..."`);
+      return; // Don't send, don't update timers — as if she never tried to speak
+    }
+
     // Only use Discord's .reply() (which tags/quotes the user) if they explicitly
     // @mentioned Merlin or replied to Merlin's message. Conversation continuations
     // and lurking responses go to the channel directly — no tag, no quote.
@@ -660,6 +694,7 @@ async function processQueue(channelId: string) {
     } else {
       await (lastMessage.channel as any).send(safeReply);
     }
+
 
 
     // Update timestamps and active user tracking

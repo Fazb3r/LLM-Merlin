@@ -6,6 +6,7 @@ import {
   getUserFacts,
   getServerDefinition,
 } from "../data/db";
+import { getServerCultureContext } from "../utils/serverStyleLearner";
 
 /* ============================================================
  *  RETURN TYPE
@@ -123,6 +124,16 @@ export async function buildMemoryBlock(message: Message): Promise<MemoryBlockRes
     lines.push("Server-specific concepts:");
     lines.push(serverDefinitionText);
     lines.push("");
+  }
+
+  // Server Culture and Style Learner context
+  if (guildId !== "DM") {
+    const cultureContext = getServerCultureContext(guildId);
+    if (cultureContext) {
+      lines.push("Server Culture & Slang Profile (Autodetected):");
+      lines.push(cultureContext);
+      lines.push("");
+    }
   }
 
   lines.push("[MEMORY BLOCK END]");

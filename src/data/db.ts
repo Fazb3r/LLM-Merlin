@@ -250,3 +250,54 @@ export function getServerDefinition(
   const row = getServerDefinitionStmt.get(guildId, term);
   return (row as ServerLexiconRow) || null;
 }
+
+/* ---------- SERVER LORE (AUTO-LEARNED CULTURE) ---------- */
+
+export interface ServerLoreRow {
+  id: number;
+  guild_id: string;
+  description: string;
+  created_by: string | null;
+  created_at: string;
+}
+
+// Fetch the latest auto-learned culture summary for a guild
+const getLatestServerLoreStmt = db.prepare(`
+  SELECT id, guild_id, description, created_by, created_at
+  FROM server_lore
+  WHERE guild_id = ? AND created_by = 'style_learner_auto'
+  ORDER BY created_at DESC
+  LIMIT 1
+`);
+export function getLatestServerLore(guildId: string): ServerLoreRow | null {
+  const row = getLatestServerLoreStmt.get(guildId);
+  return (row as ServerLoreRow) || null;
+}
+
+// Delete old auto-learned entries then insert new one (keeps only 1 auto entry per guild)
+const deleteOldServerLoreStmt = db.prepare(`
+  DELETE FROM server_lore
+  WHERE guild_id = ? AND created_by = 'style_learner_auto'
+`);
+const insertServerLoreStmt = db.prepare(`
+  INSERT INTO server_lore (guild_id, description, created_by)
+  VALUES (?, ?, 'style_learner_auto')
+`);
+export function replaceServerLore(guildId: string, description: string): void {
+  const tx = db.transaction(() => {
+    deleteOldServerLoreStmt.run(guildId);
+    insertServerLoreStmt.run(guildId, description);
+  });
+  tx();
+}
+
+// Fetch recent messages across ALL channels (for cross-channel style analysis)
+const getRecentMessagesAllStmt = db.prepare(`
+  SELECT id, user_id, username, channel_id, content, created_at
+  FROM messages
+  ORDER BY created_at DESC
+  LIMIT ?
+`);
+export function getRecentMessagesAll(limit: number): MessageRow[] {
+  return getRecentMessagesAllStmt.all(limit) as MessageRow[];
+}
