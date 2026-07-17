@@ -4,7 +4,8 @@ import { insertMessage } from "./data/db";
 
 export function setupMessageLogger(client: Client) {
   client.on(Events.MessageCreate, async (message: Message) => {
-    if (message.author.bot) return;
+    // Ignore other bots, but allow our own bot's messages to be logged for context
+    if (message.author.bot && message.author.id !== client.user?.id) return;
 
     try {
       insertMessage.run(

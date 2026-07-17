@@ -144,10 +144,13 @@ export async function buildMemoryBlock(message: Message): Promise<MemoryBlockRes
   // The LLM gets actual turn structure it can reason about.
   const conversationHistory: Array<{ role: "user" | "assistant"; content: string }> = [];
 
+  const botUserId = message.client.user?.id;
+
   for (const msg of recentMessages) {
+    const isBot = msg.user_id === botUserId;
     conversationHistory.push({
-      role: "user",
-      content: `[${msg.username}]: ${msg.content}`,
+      role: isBot ? "assistant" : "user",
+      content: isBot ? msg.content : `[${msg.username}]: ${msg.content}`,
     });
   }
 
