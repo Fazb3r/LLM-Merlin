@@ -424,9 +424,13 @@ async function processQueue(channelId: string) {
 
   try {
     /* ------------------------------------------------------------
-     * 2. Teaching detector (structured patterns)
+     * 2. Teaching detector (already ran in MessageCreate for all messages)
+     *    Run again here only for the combined multi-message debounced case.
      * ------------------------------------------------------------ */
-    detectAndStoreTeaching(lastMessage);
+    if (queue.messages.length > 1) {
+      // Re-run on the combined text; individual runs already fired above.
+      queue.messages.forEach(m => detectAndStoreTeaching(m));
+    }
 
     /* ------------------------------------------------------------
      * 3. Personal fact detection (LLM classifier - Runs in background)
@@ -756,6 +760,12 @@ client.on(Events.MessageCreate, async (message: Message) => {
     const rawText = message.content.replace(/<@!?\d+>/g, "").trim();
     const authorName =
       message.member?.displayName || message.author.username;
+
+    // ── ALWAYS: Teaching detection (runs on every message, not just when Merlin responds)
+    // This ensures server terms and user facts are captured even when Merlin is lurking.
+    if (message.guild) {
+      detectAndStoreTeaching(message);
+    }
 
     // 1. Check if there is an active queue for this channel
     const activeQueue = channelQueues.get(message.channelId);

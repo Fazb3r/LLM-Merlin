@@ -80,11 +80,16 @@ function shouldSkipLLMCall(content: string): boolean {
     return true;
   }
 
-  // Skip obvious commands/requests to Merlin
+  // Skip obvious commands/requests to Merlin (but NOT teaching patterns)
+  // "merlin busca X" → skip (command)
+  // "merlin me llamo X" → DO NOT skip (fact)
+  // "merlin soy main X" → DO NOT skip (fact)
+  const MERLIN_COMMAND_VERBS = /^mer(?:lin)?[,\s]+(?:busca|dime|ayuda|explica|help|search|tell|buscar|avísame|avisa|recuerda(?!\s+que\s+(?:me|mi|soy|trabajo|vivo)))/i;
+  if (MERLIN_COMMAND_VERBS.test(lower)) {
+    return true;
+  }
+
   if (
-    lower.startsWith("merlin") ||
-    lower.startsWith("mer ") ||
-    lower.startsWith("mer,") ||
     lower.startsWith("busca") ||
     lower.startsWith("dime") ||
     lower.startsWith("ayuda") ||
@@ -107,6 +112,12 @@ function hasFactIndicators(content: string): boolean {
   const lower = content.toLowerCase();
 
   const factPatterns = [
+    // Name / preferred name
+    /ll[aá]mame/i,
+    /me llamo/i,
+    /call me/i,
+    /my name is/i,
+
     // Spanish patterns
     /mi (juego|champion|main|campeón|skin|personaje) (favorito|preferido)/i,
     /soy main/i,

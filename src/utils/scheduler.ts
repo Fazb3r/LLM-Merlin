@@ -171,6 +171,8 @@ export function setupScheduler(client: Client): void {
   setInterval(() => runHourlyStarter(client), 60 * 60 * 1000);
   console.log("[SCHEDULER] Hourly conversation starter active (30% chance/hour).");
 
+
+
   // --- Server style learning (every 6 hours + immediate) ---
   async function runStyleLearningForAllGuilds() {
     console.log("[SCHEDULER] Running server style learning for all guilds...");
