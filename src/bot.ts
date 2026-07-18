@@ -51,7 +51,7 @@ const BOT_TOKEN = process.env.DISCORD_LLM_BOT_TOKEN;
 // llama-3.3-70b: 30 RPM, 100K TPD — generous free tier, main Groq model
 // llama-4-scout: Meta's Llama 4, good quality backup
 const GROQ_PRIMARY_MODEL   = "llama-3.3-70b-versatile";
-const GROQ_SECONDARY_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct";
+const GROQ_SECONDARY_MODEL = "llama-3.1-8b-instant";
 
 // Groq client
 const groq = new Groq({
